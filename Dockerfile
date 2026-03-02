@@ -20,9 +20,14 @@ FROM node:20-slim
 # Google Chrome includes complete trace infrastructure required by Lighthouse's
 # Lantern simulation engine. Debian Chromium lacks some tracing features,
 # causing LanternError on certain sites.
-RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
+RUN apt-get update \
+  && apt-get install -y wget gnupg --no-install-recommends \
+  && wget -q -O /tmp/chrome-key.pub https://dl.google.com/linux/linux_signing_key.pub \
+  && gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg /tmp/chrome-key.pub \
+  && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
+  && apt-get update \
+  && apt-get install -y \
+    google-chrome-stable \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -40,10 +45,7 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     xdg-utils \
     --no-install-recommends \
-  && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-  && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
-  && apt-get update \
-  && apt-get install -y google-chrome-stable --no-install-recommends \
+  && rm -f /tmp/chrome-key.pub \
   && rm -rf /var/lib/apt/lists/*
 
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
