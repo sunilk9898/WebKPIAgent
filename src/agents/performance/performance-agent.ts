@@ -91,25 +91,32 @@ const LIGHTHOUSE_MOBILE_CONFIG = {
 // Max retry attempts for Lighthouse when it returns 0/null
 const LIGHTHOUSE_MAX_RETRIES = 3;
 
-// Chrome flags optimized for Docker/headless containers
-// NOTE: --single-process and --no-zygote MUST NOT be used — they break
-// Lighthouse tracing (causes LanternError / performance mark errors).
-// Chrome needs its multi-process architecture for proper page traces.
+// Chrome flags for Docker/headless containers.
+//
+// IMPORTANT: Keep this list MINIMAL. Extra flags can break Lighthouse's
+// Lantern trace engine (LanternError: missing metric scores).
+// Specifically:
+//   - DO NOT use --single-process or --no-zygote (breaks multi-process tracing)
+//   - DO NOT use --metrics-recording-only (limits trace events Lighthouse needs)
+//   - DO NOT use --disable-background-networking (breaks network trace data)
+//   - DO NOT use --disable-dev-shm-usage IF shm_size >= 1gb (forces slow /tmp)
+//
+// With docker-compose shm_size: 2gb, Chrome can use fast /dev/shm for IPC.
 const CHROME_FLAGS = [
-  '--headless',
+  '--headless=new',
   '--no-sandbox',
   '--disable-gpu',
-  '--disable-dev-shm-usage',
-  '--disable-setuid-sandbox',
-  '--disable-software-rasterizer',
-  '--disable-extensions',
-  '--disable-background-networking',
-  '--disable-default-apps',
-  '--disable-sync',
   '--no-first-run',
-  '--disable-translate',
-  '--metrics-recording-only',
-  '--mute-audio',
+  '--disable-extensions',
+];
+
+// Puppeteer-specific flags (superset of CHROME_FLAGS for non-Lighthouse uses)
+const PUPPETEER_FLAGS = [
+  '--no-sandbox',
+  '--disable-gpu',
+  '--no-first-run',
+  '--disable-extensions',
+  '--disable-dev-shm-usage',
 ];
 
 export class PerformanceAgent extends BaseAgent {
@@ -371,7 +378,7 @@ export class PerformanceAgent extends BaseAgent {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
-        ...CHROME_FLAGS.filter(f => f !== '--headless'), // puppeteer handles headless
+        ...PUPPETEER_FLAGS,
         ...(platform === 'mweb' ? ['--window-size=375,812'] : ['--window-size=1350,940']),
       ],
     });
@@ -481,7 +488,7 @@ export class PerformanceAgent extends BaseAgent {
     const browser = await puppeteer.launch({
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: [...CHROME_FLAGS.filter(f => f !== '--headless'), '--autoplay-policy=no-user-gesture-required'],
+      args: [...PUPPETEER_FLAGS, '--autoplay-policy=no-user-gesture-required'],
     });
 
     try {
@@ -607,7 +614,7 @@ export class PerformanceAgent extends BaseAgent {
     const browser = await puppeteer.launch({
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: CHROME_FLAGS.filter(f => f !== '--headless'),
+      args: PUPPETEER_FLAGS,
     });
 
     try {
@@ -695,7 +702,7 @@ export class PerformanceAgent extends BaseAgent {
     const browser = await puppeteer.launch({
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: CHROME_FLAGS.filter(f => f !== '--headless'),
+      args: PUPPETEER_FLAGS,
     });
 
     try {
