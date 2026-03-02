@@ -41,6 +41,8 @@ RUN apt-get update && apt-get install -y \
 
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+# CHROME_PATH is used by chrome-launcher (for Lighthouse)
+ENV CHROME_PATH=/usr/bin/chromium
 ENV NODE_ENV=production
 
 WORKDIR /app

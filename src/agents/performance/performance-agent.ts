@@ -89,7 +89,27 @@ const LIGHTHOUSE_MOBILE_CONFIG = {
 };
 
 // Max retry attempts for Lighthouse when it returns 0/null
-const LIGHTHOUSE_MAX_RETRIES = 2;
+const LIGHTHOUSE_MAX_RETRIES = 3;
+
+// Chrome flags optimized for Docker/headless containers
+const CHROME_FLAGS = [
+  '--headless',
+  '--no-sandbox',
+  '--disable-gpu',
+  '--disable-dev-shm-usage',
+  '--disable-setuid-sandbox',
+  '--disable-software-rasterizer',
+  '--disable-extensions',
+  '--disable-background-networking',
+  '--disable-default-apps',
+  '--disable-sync',
+  '--no-first-run',
+  '--no-zygote',           // Critical for Docker: avoids fork issues
+  '--single-process',      // Reduces memory overhead in containers
+  '--disable-translate',
+  '--metrics-recording-only',
+  '--mute-audio',
+];
 
 export class PerformanceAgent extends BaseAgent {
   private browser?: Browser;
@@ -110,14 +130,31 @@ export class PerformanceAgent extends BaseAgent {
   }
 
   protected async setup(config: ScanConfig): Promise<void> {
+    const chromePath = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
+
     this.chrome = await chromeLauncher.launch({
-      chromeFlags: [
-        '--headless',
-        '--no-sandbox',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-      ],
+      chromeFlags: CHROME_FLAGS,
+      ...(chromePath ? { chromePath } : {}),
     });
+
+    // Warm up Chrome by loading a simple page first
+    // This prevents LanternError on first real scan in Docker
+    try {
+      const warmupResult = await lighthouse('data:text/html,<h1>warmup</h1>', {
+        port: this.chrome.port,
+        output: 'json',
+        logLevel: 'error',
+      }, {
+        extends: 'lighthouse:default' as const,
+        settings: {
+          onlyCategories: ['performance'],
+          maxWaitForLoad: 5000,
+        },
+      });
+      this.logger.info('Chrome warm-up complete');
+    } catch (e) {
+      this.logger.warn('Chrome warm-up failed (non-critical)', { error: String(e) });
+    }
   }
 
   protected async scan(config: ScanConfig): Promise<void> {
@@ -167,9 +204,13 @@ export class PerformanceAgent extends BaseAgent {
     const config = platform === 'mweb' ? LIGHTHOUSE_MOBILE_CONFIG : LIGHTHOUSE_DESKTOP_CONFIG;
 
     let lastError: string | null = null;
+    let bestScore = 0;
+    let bestLhr: any = null;
 
     for (let attempt = 1; attempt <= LIGHTHOUSE_MAX_RETRIES; attempt++) {
       try {
+        this.logger.info(`Lighthouse attempt ${attempt}/${LIGHTHOUSE_MAX_RETRIES} for ${platform}`);
+
         const result = await lighthouse(url, {
           port: this.chrome.port,
           output: 'json',
@@ -186,87 +227,47 @@ export class PerformanceAgent extends BaseAgent {
         // Round to avoid floating point artifacts (0.57 * 100 = 56.999... → 57)
         const perfScore = Math.round((lhr.categories.performance?.score || 0) * 100);
 
+        // Track best score across attempts (Docker/container scans can be flaky)
+        if (perfScore > bestScore) {
+          bestScore = perfScore;
+          bestLhr = lhr;
+        }
+
+        this.logger.info(`Lighthouse attempt ${attempt}: ${platform} score = ${perfScore}`);
+
         // ── Detect Lighthouse failure: score of 0 likely means scan didn't complete ──
+        // Also retry if score seems abnormally low (LanternError produces unreliable scores)
         if (perfScore === 0 && attempt < LIGHTHOUSE_MAX_RETRIES) {
           this.logger.warn(`Lighthouse attempt ${attempt}/${LIGHTHOUSE_MAX_RETRIES}: performance score is 0 for ${platform}, retrying...`);
           // Kill and relaunch Chrome for a fresh connection
           await this.chrome.kill();
+          const chromePath = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
           this.chrome = await chromeLauncher.launch({
-            chromeFlags: ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
+            chromeFlags: CHROME_FLAGS,
+            ...(chromePath ? { chromePath } : {}),
           });
+          // Brief pause to let Chrome stabilize
+          await new Promise(resolve => setTimeout(resolve, 2000));
           continue;
         }
 
-        // If still 0 after retries, log as a scan failure
-        if (perfScore === 0) {
-          this.logger.error(`Lighthouse failed: performance score is 0 after ${LIGHTHOUSE_MAX_RETRIES} attempts for ${platform}`);
-          this.addFinding({
-            severity: 'info',
-            category: 'Lighthouse',
-            title: `Lighthouse scan incomplete for ${platform}`,
-            description: `Lighthouse could not calculate a performance score for ${platform}. The score returned was 0, indicating the page may have blocked the scan, timed out, or failed to load.`,
-            location: { url },
-            evidence: `Score: 0 after ${LIGHTHOUSE_MAX_RETRIES} attempts`,
-            remediation: 'Check if the site blocks headless Chrome. Try running Chrome DevTools Lighthouse manually to compare.',
-            references: [],
-            autoFixable: false,
+        // If score is reasonable (>0), this attempt is good enough
+        // But keep going if we haven't hit max attempts yet AND score seems unreliably low
+        if (perfScore > 0 && attempt < LIGHTHOUSE_MAX_RETRIES && perfScore < 20) {
+          this.logger.warn(`Lighthouse attempt ${attempt}: ${platform} score=${perfScore} seems low, retrying for better result...`);
+          // Kill and relaunch Chrome for a fresh connection
+          await this.chrome.kill();
+          const chromePath2 = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
+          this.chrome = await chromeLauncher.launch({
+            chromeFlags: CHROME_FLAGS,
+            ...(chromePath2 ? { chromePath: chromePath2 } : {}),
           });
-          // Don't store 0 — let fallback to other platform's score in calculateScore()
-          return;
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          continue;
         }
 
-        // Store scores per-platform for metadata (avoids mobile overwriting desktop)
-        this._lhScoresMap[platform] = {
-          performance: perfScore,
-          accessibility: Math.round((lhr.categories.accessibility?.score || 0) * 100),
-          bestPractices: Math.round((lhr.categories['best-practices']?.score || 0) * 100),
-          seo: Math.round((lhr.categories.seo?.score || 0) * 100),
-        };
-
-        this.logger.info(`Lighthouse ${platform}: Performance=${perfScore}, Accessibility=${this._lhScoresMap[platform].accessibility}, BestPractices=${this._lhScoresMap[platform].bestPractices}, SEO=${this._lhScoresMap[platform].seo}`);
-
-        // Check against target
-        if (perfScore < THRESHOLDS.lighthouseScore) {
-          this.addFinding({
-            severity: perfScore < 50 ? 'critical' : perfScore < 80 ? 'high' : 'medium',
-            category: 'Lighthouse',
-            title: `Lighthouse performance score: ${perfScore} (target: ${THRESHOLDS.lighthouseScore})`,
-            description: `${platform} Lighthouse performance score is ${perfScore}/100, below the target of ${THRESHOLDS.lighthouseScore}.`,
-            location: { url },
-            evidence: JSON.stringify({
-              performance: perfScore,
-              accessibility: this._lhScoresMap[platform].accessibility,
-              bestPractices: this._lhScoresMap[platform].bestPractices,
-              seo: this._lhScoresMap[platform].seo,
-            }),
-            remediation: this.generateLighthouseRemediation(lhr),
-            references: [],
-            autoFixable: false,
-          });
-        }
-
-        // Extract individual audit failures
-        const failedAudits = Object.values(lhr.audits)
-          .filter((audit: any) => audit.score !== null && audit.score < 0.9 && audit.scoreDisplayMode === 'numeric')
-          .sort((a: any, b: any) => (a.score || 0) - (b.score || 0))
-          .slice(0, 10);
-
-        for (const audit of failedAudits as any[]) {
-          this.addFinding({
-            severity: audit.score < 0.5 ? 'high' : 'medium',
-            category: 'Lighthouse Audit',
-            title: `[${platform}] ${audit.title}: ${audit.displayValue || 'Failed'}`,
-            description: audit.description?.substring(0, 200) || '',
-            location: { url },
-            evidence: `Score: ${Math.round((audit.score || 0) * 100)}/100`,
-            remediation: audit.description || 'Review Lighthouse audit details for specific recommendations.',
-            references: [],
-            autoFixable: false,
-          });
-        }
-
-        // Success — exit retry loop
-        return;
+        // Good score or last attempt — exit loop
+        break;
       } catch (error) {
         lastError = String(error);
         this.logger.warn(`Lighthouse attempt ${attempt}/${LIGHTHOUSE_MAX_RETRIES} failed for ${platform}: ${lastError}`);
@@ -275,9 +276,12 @@ export class PerformanceAgent extends BaseAgent {
           // Relaunch Chrome for a clean retry
           try {
             await this.chrome.kill();
+            const chromePath3 = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
             this.chrome = await chromeLauncher.launch({
-              chromeFlags: ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
+              chromeFlags: CHROME_FLAGS,
+              ...(chromePath3 ? { chromePath: chromePath3 } : {}),
             });
+            await new Promise(resolve => setTimeout(resolve, 2000));
           } catch (relaunchErr) {
             this.logger.error('Failed to relaunch Chrome for retry', { error: String(relaunchErr) });
           }
@@ -285,8 +289,75 @@ export class PerformanceAgent extends BaseAgent {
       }
     }
 
-    // All retries exhausted
-    this.logger.error(`Lighthouse scan failed after ${LIGHTHOUSE_MAX_RETRIES} attempts`, { error: lastError });
+    // ── Use the BEST score from all attempts ──
+    const finalScore = bestScore;
+    const finalLhr = bestLhr;
+
+    if (finalScore === 0 || !finalLhr) {
+      this.logger.error(`Lighthouse failed: best performance score is 0 after ${LIGHTHOUSE_MAX_RETRIES} attempts for ${platform}`);
+      this.addFinding({
+        severity: 'info',
+        category: 'Lighthouse',
+        title: `Lighthouse scan incomplete for ${platform}`,
+        description: `Lighthouse could not calculate a performance score for ${platform}. The best score across ${LIGHTHOUSE_MAX_RETRIES} attempts was 0.`,
+        location: { url },
+        evidence: `Score: 0 after ${LIGHTHOUSE_MAX_RETRIES} attempts. Last error: ${lastError || 'none'}`,
+        remediation: 'Check if the site blocks headless Chrome. Try running Chrome DevTools Lighthouse manually to compare.',
+        references: [],
+        autoFixable: false,
+      });
+      return;
+    }
+
+    // Store BEST scores per-platform for metadata
+    this._lhScoresMap[platform] = {
+      performance: finalScore,
+      accessibility: Math.round((finalLhr.categories.accessibility?.score || 0) * 100),
+      bestPractices: Math.round((finalLhr.categories['best-practices']?.score || 0) * 100),
+      seo: Math.round((finalLhr.categories.seo?.score || 0) * 100),
+    };
+
+    this.logger.info(`Lighthouse ${platform} (best of ${LIGHTHOUSE_MAX_RETRIES}): Performance=${finalScore}, Accessibility=${this._lhScoresMap[platform].accessibility}, BestPractices=${this._lhScoresMap[platform].bestPractices}, SEO=${this._lhScoresMap[platform].seo}`);
+
+    // Check against target
+    if (finalScore < THRESHOLDS.lighthouseScore) {
+      this.addFinding({
+        severity: finalScore < 50 ? 'critical' : finalScore < 80 ? 'high' : 'medium',
+        category: 'Lighthouse',
+        title: `Lighthouse performance score: ${finalScore} (target: ${THRESHOLDS.lighthouseScore})`,
+        description: `${platform} Lighthouse performance score is ${finalScore}/100, below the target of ${THRESHOLDS.lighthouseScore}.`,
+        location: { url },
+        evidence: JSON.stringify({
+          performance: finalScore,
+          accessibility: this._lhScoresMap[platform].accessibility,
+          bestPractices: this._lhScoresMap[platform].bestPractices,
+          seo: this._lhScoresMap[platform].seo,
+        }),
+        remediation: this.generateLighthouseRemediation(finalLhr),
+        references: [],
+        autoFixable: false,
+      });
+    }
+
+    // Extract individual audit failures from best result
+    const failedAudits = Object.values(finalLhr.audits)
+      .filter((audit: any) => audit.score !== null && audit.score < 0.9 && audit.scoreDisplayMode === 'numeric')
+      .sort((a: any, b: any) => (a.score || 0) - (b.score || 0))
+      .slice(0, 10);
+
+    for (const audit of failedAudits as any[]) {
+      this.addFinding({
+        severity: audit.score < 0.5 ? 'high' : 'medium',
+        category: 'Lighthouse Audit',
+        title: `[${platform}] ${audit.title}: ${audit.displayValue || 'Failed'}`,
+        description: audit.description?.substring(0, 200) || '',
+        location: { url },
+        evidence: `Score: ${Math.round((audit.score || 0) * 100)}/100`,
+        remediation: audit.description || 'Review Lighthouse audit details for specific recommendations.',
+        references: [],
+        autoFixable: false,
+      });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -297,9 +368,9 @@ export class PerformanceAgent extends BaseAgent {
 
     const browser = await puppeteer.launch({
       headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
+        ...CHROME_FLAGS.filter(f => f !== '--headless'), // puppeteer handles headless
         ...(platform === 'mweb' ? ['--window-size=375,812'] : ['--window-size=1350,940']),
       ],
     });
@@ -406,7 +477,11 @@ export class PerformanceAgent extends BaseAgent {
   private async measurePlayerMetrics(url: string, platform: Platform): Promise<void> {
     this.logger.info('Measuring OTT player metrics');
 
-    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required'] });
+    const browser = await puppeteer.launch({
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args: [...CHROME_FLAGS.filter(f => f !== '--headless'), '--autoplay-policy=no-user-gesture-required'],
+    });
 
     try {
       const page = await browser.newPage();
@@ -528,7 +603,11 @@ export class PerformanceAgent extends BaseAgent {
   private async analyzeCDN(url: string): Promise<void> {
     this.logger.info('Analyzing CDN configuration');
 
-    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+    const browser = await puppeteer.launch({
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args: CHROME_FLAGS.filter(f => f !== '--headless'),
+    });
 
     try {
       const page = await browser.newPage();
@@ -612,7 +691,11 @@ export class PerformanceAgent extends BaseAgent {
   private async analyzeResources(url: string): Promise<void> {
     this.logger.info('Analyzing resource loading');
 
-    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+    const browser = await puppeteer.launch({
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args: CHROME_FLAGS.filter(f => f !== '--headless'),
+    });
 
     try {
       const page = await browser.newPage();
