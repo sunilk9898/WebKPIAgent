@@ -5,19 +5,26 @@ import {
   Gauge, Zap, Clock, MonitorPlay, ServerCrash, HardDrive,
   Wifi, Image, FileCode, ArrowRight, BarChart3,
 } from "lucide-react";
-import { RadialBarChart, RadialBar, ResponsiveContainer, Tooltip } from "recharts";
 import { KPIGauge } from "@/components/charts/kpi-gauge";
 import { CWVBars } from "@/components/charts/cwv-bars";
 import { MetricCard } from "@/components/cards/metric-card";
 import { FindingRow } from "@/components/cards/finding-row";
 import { JsonViewer } from "@/components/shared/json-viewer";
+import { DetailDrawer } from "@/components/shared/detail-drawer";
+import { CWVDetail } from "@/components/details/cwv-detail";
+import { PlayerDetail } from "@/components/details/player-detail";
+import { CDNDetail } from "@/components/details/cdn-detail";
+import { ResourceDetail } from "@/components/details/resource-detail";
 import { useScanReport } from "@/hooks/use-scan-report";
 import { cn, formatMs, formatBytes } from "@/lib/utils";
 import type { PerformanceMetadata } from "@/types/api";
 
+type DetailKey = string | null;
+
 export default function PerformancePage() {
   const { report, performanceResult } = useScanReport();
   const [activeTab, setActiveTab] = useState<"overview" | "cwv" | "player" | "cdn" | "raw">("overview");
+  const [activeDetail, setActiveDetail] = useState<DetailKey>(null);
 
   if (!report || !performanceResult) {
     return (
@@ -41,13 +48,24 @@ export default function PerformancePage() {
     { id: "raw" as const, label: "Raw JSON" },
   ];
 
-  // Lighthouse gauge data for radial chart
-  const lighthouseData = meta?.lighthouse ? [
-    { name: "Performance", score: meta.lighthouse.performanceScore, fill: meta.lighthouse.performanceScore >= 90 ? "#22c55e" : meta.lighthouse.performanceScore >= 50 ? "#f59e0b" : "#ef4444" },
-    { name: "Accessibility", score: meta.lighthouse.accessibilityScore, fill: "#3b82f6" },
-    { name: "Best Practices", score: meta.lighthouse.bestPracticesScore, fill: "#a855f7" },
-    { name: "SEO", score: meta.lighthouse.seoScore, fill: "#06b6d4" },
-  ] : [];
+  const getDrawerInfo = () => {
+    if (!activeDetail) return { title: "", subtitle: "" };
+    if (activeDetail.startsWith("cwv:")) {
+      const key = activeDetail.replace("cwv:", "");
+      const names: Record<string, string> = { lcp: "Largest Contentful Paint", fcp: "First Contentful Paint", cls: "Cumulative Layout Shift", ttfb: "Time to First Byte", fid: "First Input Delay", inp: "Interaction to Next Paint" };
+      return { title: names[key] || key.toUpperCase(), subtitle: "Core Web Vital Metric" };
+    }
+    if (activeDetail.startsWith("player:")) {
+      const key = activeDetail.replace("player:", "");
+      const names: Record<string, string> = { startupDelay: "Startup Delay", timeToFirstFrame: "Time to First Frame", bufferRatio: "Buffer Ratio", rebufferEvents: "Rebuffer Events", abrSwitchCount: "ABR Switches", drmLicenseTime: "DRM License Time", playbackFailures: "Playback Failures" };
+      return { title: names[key] || key, subtitle: "OTT Player Metric" };
+    }
+    if (activeDetail === "cdn") return { title: "CDN Performance", subtitle: "Content Delivery Network Analysis" };
+    if (activeDetail === "resources") return { title: "Resource Analysis", subtitle: "Page Weight & Asset Optimization" };
+    return { title: "", subtitle: "" };
+  };
+
+  const drawerInfo = getDrawerInfo();
 
   return (
     <div className="space-y-6 max-w-[1440px] mx-auto">
@@ -97,7 +115,7 @@ export default function PerformancePage() {
             </div>
           )}
 
-          {/* Quick CWV Metrics */}
+          {/* Quick CWV Metrics — ALL CLICKABLE */}
           {meta?.coreWebVitals && (
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
               {Object.entries(meta.coreWebVitals).map(([key, v]) => (
@@ -108,6 +126,7 @@ export default function PerformancePage() {
                   subtitle={`Target: <${key === "lcp" ? "2.5s" : key === "fcp" ? "1.8s" : key === "cls" ? "0.1" : key === "ttfb" ? "800ms" : key === "inp" ? "200ms" : "100ms"}`}
                   icon={Clock}
                   status={v.rating === "good" ? "good" : v.rating === "needs-improvement" ? "warn" : "bad"}
+                  onClick={() => setActiveDetail(`cwv:${key}`)}
                 />
               ))}
             </div>
@@ -138,7 +157,7 @@ export default function PerformancePage() {
             <CWVBars vitals={meta.coreWebVitals} height={300} />
           </div>
 
-          {/* Detail cards */}
+          {/* Detail cards — ALL CLICKABLE */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {Object.entries(meta.coreWebVitals).map(([key, v]) => {
               const targets: Record<string, number> = { lcp: 2500, fcp: 1800, cls: 0.1, ttfb: 800, fid: 100, inp: 200 };
@@ -146,7 +165,11 @@ export default function PerformancePage() {
               const pct = target > 0 ? ((v.value / target) * 100).toFixed(0) : "—";
 
               return (
-                <div key={key} className="card p-4 space-y-2">
+                <button
+                  key={key}
+                  onClick={() => setActiveDetail(`cwv:${key}`)}
+                  className="card p-4 space-y-2 text-left w-full cursor-pointer hover:bg-white/[0.04] hover:border-brand-500/30 transition-all group"
+                >
                   <div className="flex items-center justify-between">
                     <span className="text-sm font-bold text-gray-200">{key.toUpperCase()}</span>
                     <span className={cn(
@@ -173,65 +196,26 @@ export default function PerformancePage() {
                     />
                   </div>
                   <div className="text-xs text-gray-500">{pct}% of target ({key === "cls" ? target : formatMs(target)})</div>
-                </div>
+                  <div className="text-[10px] text-gray-600 group-hover:text-gray-400 transition-colors">Click for details</div>
+                </button>
               );
             })}
           </div>
         </div>
       )}
 
-      {/* ── PLAYER METRICS TAB ── */}
+      {/* ── PLAYER METRICS TAB — ALL CLICKABLE ── */}
       {activeTab === "player" && (
         <div className="space-y-6">
           {meta?.playerMetrics ? (
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <MetricCard
-                label="Startup Delay"
-                value={formatMs(meta.playerMetrics.startupDelay)}
-                subtitle="Target: <3s"
-                icon={Zap}
-                status={meta.playerMetrics.startupDelay < 3000 ? "good" : "bad"}
-              />
-              <MetricCard
-                label="Time to First Frame"
-                value={formatMs(meta.playerMetrics.timeToFirstFrame)}
-                subtitle="Target: <4s"
-                icon={MonitorPlay}
-                status={meta.playerMetrics.timeToFirstFrame < 4000 ? "good" : "bad"}
-              />
-              <MetricCard
-                label="Buffer Ratio"
-                value={`${(meta.playerMetrics.bufferRatio * 100).toFixed(1)}%`}
-                subtitle="Target: <2%"
-                icon={HardDrive}
-                status={meta.playerMetrics.bufferRatio < 0.02 ? "good" : "bad"}
-              />
-              <MetricCard
-                label="Rebuffer Events"
-                value={meta.playerMetrics.rebufferEvents}
-                icon={ServerCrash}
-                status={meta.playerMetrics.rebufferEvents === 0 ? "good" : "bad"}
-              />
-              <MetricCard
-                label="ABR Switches"
-                value={meta.playerMetrics.abrSwitchCount}
-                subtitle={`Avg latency: ${formatMs(meta.playerMetrics.abrSwitchLatency)}`}
-                icon={BarChart3}
-                status="neutral"
-              />
-              <MetricCard
-                label="DRM License Time"
-                value={formatMs(meta.playerMetrics.drmLicenseTime)}
-                subtitle="Target: <2s"
-                icon={Clock}
-                status={meta.playerMetrics.drmLicenseTime < 2000 ? "good" : "bad"}
-              />
-              <MetricCard
-                label="Playback Failures"
-                value={meta.playerMetrics.playbackFailures}
-                icon={ServerCrash}
-                status={meta.playerMetrics.playbackFailures === 0 ? "good" : "bad"}
-              />
+              <MetricCard label="Startup Delay" value={formatMs(meta.playerMetrics.startupDelay)} subtitle="Target: <3s" icon={Zap} status={meta.playerMetrics.startupDelay < 3000 ? "good" : "bad"} onClick={() => setActiveDetail("player:startupDelay")} />
+              <MetricCard label="Time to First Frame" value={formatMs(meta.playerMetrics.timeToFirstFrame)} subtitle="Target: <4s" icon={MonitorPlay} status={meta.playerMetrics.timeToFirstFrame < 4000 ? "good" : "bad"} onClick={() => setActiveDetail("player:timeToFirstFrame")} />
+              <MetricCard label="Buffer Ratio" value={`${(meta.playerMetrics.bufferRatio * 100).toFixed(1)}%`} subtitle="Target: <2%" icon={HardDrive} status={meta.playerMetrics.bufferRatio < 0.02 ? "good" : "bad"} onClick={() => setActiveDetail("player:bufferRatio")} />
+              <MetricCard label="Rebuffer Events" value={meta.playerMetrics.rebufferEvents} icon={ServerCrash} status={meta.playerMetrics.rebufferEvents === 0 ? "good" : "bad"} onClick={() => setActiveDetail("player:rebufferEvents")} />
+              <MetricCard label="ABR Switches" value={meta.playerMetrics.abrSwitchCount} subtitle={`Avg latency: ${formatMs(meta.playerMetrics.abrSwitchLatency)}`} icon={BarChart3} status="neutral" onClick={() => setActiveDetail("player:abrSwitchCount")} />
+              <MetricCard label="DRM License Time" value={formatMs(meta.playerMetrics.drmLicenseTime)} subtitle="Target: <2s" icon={Clock} status={meta.playerMetrics.drmLicenseTime < 2000 ? "good" : "bad"} onClick={() => setActiveDetail("player:drmLicenseTime")} />
+              <MetricCard label="Playback Failures" value={meta.playerMetrics.playbackFailures} icon={ServerCrash} status={meta.playerMetrics.playbackFailures === 0 ? "good" : "bad"} onClick={() => setActiveDetail("player:playbackFailures")} />
             </div>
           ) : (
             <div className="card p-8 text-center text-gray-500 text-sm">No player detected on page</div>
@@ -239,32 +223,27 @@ export default function PerformancePage() {
         </div>
       )}
 
-      {/* ── CDN & RESOURCES TAB ── */}
+      {/* ── CDN & RESOURCES TAB — ALL CLICKABLE ── */}
       {activeTab === "cdn" && (
         <div className="space-y-6">
           {meta?.cdnMetrics && (
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <MetricCard
-                label="CDN Hit Ratio"
-                value={`${(meta.cdnMetrics.hitRatio * 100).toFixed(1)}%`}
-                subtitle="Target: >95%"
-                icon={Wifi}
-                status={meta.cdnMetrics.hitRatio >= 0.95 ? "good" : "warn"}
-              />
-              <MetricCard label="Avg Latency" value={formatMs(meta.cdnMetrics.avgLatency)} icon={Clock} status="neutral" />
-              <MetricCard label="P95 Latency" value={formatMs(meta.cdnMetrics.p95Latency)} icon={Clock} status="neutral" />
-              <MetricCard
-                label="Compression"
-                value={meta.cdnMetrics.compressionEnabled ? "Enabled" : "Disabled"}
-                icon={HardDrive}
-                status={meta.cdnMetrics.compressionEnabled ? "good" : "bad"}
-              />
+              <MetricCard label="CDN Hit Ratio" value={`${(meta.cdnMetrics.hitRatio * 100).toFixed(1)}%`} subtitle="Target: >95%" icon={Wifi} status={meta.cdnMetrics.hitRatio >= 0.95 ? "good" : "warn"} onClick={() => setActiveDetail("cdn")} />
+              <MetricCard label="Avg Latency" value={formatMs(meta.cdnMetrics.avgLatency)} icon={Clock} status="neutral" onClick={() => setActiveDetail("cdn")} />
+              <MetricCard label="P95 Latency" value={formatMs(meta.cdnMetrics.p95Latency)} icon={Clock} status="neutral" onClick={() => setActiveDetail("cdn")} />
+              <MetricCard label="Compression" value={meta.cdnMetrics.compressionEnabled ? "Enabled" : "Disabled"} icon={HardDrive} status={meta.cdnMetrics.compressionEnabled ? "good" : "bad"} onClick={() => setActiveDetail("cdn")} />
             </div>
           )}
 
           {meta?.resourceMetrics && (
-            <div className="card p-5">
-              <h3 className="text-sm font-semibold text-gray-200 mb-4">Resource Breakdown</h3>
+            <button
+              onClick={() => setActiveDetail("resources")}
+              className="card p-5 w-full text-left cursor-pointer hover:bg-white/[0.04] hover:border-brand-500/30 transition-all group"
+            >
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-sm font-semibold text-gray-200">Resource Breakdown</h3>
+                <div className="text-[10px] text-gray-600 group-hover:text-brand-400 transition-colors">Click for details</div>
+              </div>
               <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4">
                 <ResourceBar label="Total" size={meta.resourceMetrics.totalSize} max={meta.resourceMetrics.totalSize} color="bg-gray-400" />
                 <ResourceBar label="JS" size={meta.resourceMetrics.jsSize} max={meta.resourceMetrics.totalSize} color="bg-amber-500" />
@@ -288,13 +267,39 @@ export default function PerformancePage() {
                   ))}
                 </div>
               )}
-            </div>
+            </button>
           )}
         </div>
       )}
 
       {/* ── RAW JSON ── */}
       {activeTab === "raw" && <JsonViewer data={performanceResult} defaultExpanded maxHeight={600} />}
+
+      {/* ── DETAIL DRAWER ── */}
+      <DetailDrawer
+        title={drawerInfo.title}
+        subtitle={drawerInfo.subtitle}
+        isOpen={!!activeDetail}
+        onClose={() => setActiveDetail(null)}
+      >
+        {activeDetail?.startsWith("cwv:") && meta?.coreWebVitals && (() => {
+          const key = activeDetail.replace("cwv:", "");
+          const v = meta.coreWebVitals[key];
+          return v ? <CWVDetail metricKey={key} value={v.value} rating={v.rating} findings={findings} /> : null;
+        })()}
+
+        {activeDetail?.startsWith("player:") && meta?.playerMetrics && (
+          <PlayerDetail metricKey={activeDetail.replace("player:", "")} playerMetrics={meta.playerMetrics} findings={findings} />
+        )}
+
+        {activeDetail === "cdn" && meta?.cdnMetrics && (
+          <CDNDetail cdnMetrics={meta.cdnMetrics} findings={findings} />
+        )}
+
+        {activeDetail === "resources" && meta?.resourceMetrics && (
+          <ResourceDetail resourceMetrics={meta.resourceMetrics} findings={findings} />
+        )}
+      </DetailDrawer>
     </div>
   );
 }

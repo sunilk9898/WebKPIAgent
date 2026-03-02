@@ -1,69 +1,52 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { usePathname, useRouter } from "next/navigation";
+import { useEffect } from "react";
 import { Sidebar } from "./sidebar";
 import { Header } from "./header";
-import { useAuthStore, useUIStore, useReportStore, useScanStore } from "@/lib/store";
+import { useUIStore, useReportStore, useScanStore } from "@/lib/store";
 import { getLatestReport } from "@/lib/api";
 import { connect, disconnect, onScanComplete, onScanError } from "@/lib/websocket";
 import { cn } from "@/lib/utils";
 
 export function Shell({ children }: { children: React.ReactNode }) {
-  // ---- ALL hooks MUST be called before any conditional return ----
   const { sidebarCollapsed } = useUIStore();
-  const { target, report, setReport, setTarget, setLoading, setError } = useReportStore();
-  const { token } = useAuthStore();
-  const { completeScan, setActiveScan } = useScanStore();
-  const pathname = usePathname();
-  const router = useRouter();
+  const { target, setReport, setLoading, setError } = useReportStore();
 
-  // Hydration guard: zustand persist loads from localStorage async,
-  // so token is null on the very first render. Wait one tick.
-  const [hydrated, setHydrated] = useState(false);
+  // Load latest report when target changes
   useEffect(() => {
-    setHydrated(true);
-  }, []);
-
-  const isLoginPage = pathname === "/login";
-
-  // Client-side auth guard (middleware doesn't work in static export)
-  useEffect(() => {
-    if (!hydrated) return;
-    if (!token && !isLoginPage) {
-      router.replace("/login");
-    }
-  }, [hydrated, token, isLoginPage, router]);
-
-  // Load latest report when target changes (only when authenticated)
-  useEffect(() => {
-    if (!token || isLoginPage || !target) return;
+    if (!target) return;
     let cancelled = false;
 
     setLoading(true);
     getLatestReport(target)
-      .then((r) => {
-        if (!cancelled) setReport(r);
+      .then((report) => {
+        if (!cancelled) setReport(report);
       })
       .catch((err) => {
         if (!cancelled) setError(err.message);
       });
 
     return () => { cancelled = true; };
-  }, [token, isLoginPage, target, setReport, setLoading, setError]);
+  }, [target, setReport, setLoading, setError]);
 
-  // Connect WebSocket on mount (only when authenticated)
+  const { completeScan, setActiveScan } = useScanStore();
+
+  // Connect WebSocket ONCE on mount — never disconnect during batch scans.
+  // Read `target` from the store inside the callback to avoid putting it in
+  // the dependency array, which would disconnect/reconnect the socket every
+  // time target changes and cause batch progress events to be lost.
   useEffect(() => {
-    if (!token || isLoginPage) return;
-
     const socket = connect();
     const unsubComplete = onScanComplete((data) => {
       completeScan(data.scanId, data.score, data.status);
-      if (target) {
-        getLatestReport(target).then(setReport).catch(() => {});
+      const currentTarget = useReportStore.getState().target;
+      if (currentTarget) {
+        getLatestReport(currentTarget)
+          .then((r) => useReportStore.getState().setReport(r))
+          .catch(() => {});
       }
     });
-    const unsubError = onScanError((data) => {
+    const unsubError = onScanError(() => {
       setActiveScan(null);
     });
 
@@ -72,19 +55,8 @@ export function Shell({ children }: { children: React.ReactNode }) {
       unsubError();
       disconnect();
     };
-  }, [token, isLoginPage, target, setReport, completeScan, setActiveScan]);
-
-  // ---- Conditional returns AFTER all hooks ----
-
-  // If on login page, render children directly (no sidebar/header)
-  if (isLoginPage) {
-    return <>{children}</>;
-  }
-
-  // Wait for hydration before deciding to show content or redirect
-  if (!hydrated || !token) {
-    return null;
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [completeScan, setActiveScan]);
 
   return (
     <div className="min-h-screen bg-surface-0">

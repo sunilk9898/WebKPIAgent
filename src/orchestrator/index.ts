@@ -83,6 +83,7 @@ export class Orchestrator {
     agents?: AgentType[];
     platform?: Platform;
     notifications?: NotificationConfig;
+    thresholds?: Partial<ScoreThresholds>;
   }): ScanConfig {
     return {
       id: `scan_${uuid()}`,
@@ -94,10 +95,10 @@ export class Orchestrator {
       agents: params.agents || ['security', 'performance', 'code-quality'],
       platform: params.platform || 'both',
       thresholds: {
-        overall: 95,
-        security: 90,
-        performance: 95,
-        codeQuality: 85,
+        overall: params.thresholds?.overall ?? 95,
+        security: params.thresholds?.security ?? 90,
+        performance: params.thresholds?.performance ?? 95,
+        codeQuality: params.thresholds?.codeQuality ?? 85,
       },
       notifications: params.notifications || {},
       createdAt: new Date(),

@@ -10,6 +10,7 @@ import type {
   UserRole,
   ScanStatus,
   AgentType,
+  ComparisonResult,
 } from "@/types/api";
 
 // ---------------------------------------------------------------------------
@@ -72,7 +73,7 @@ export const useReportStore = create<ReportStore>((set) => ({
   target: "",
   loading: false,
   error: null,
-  setReport: (report) => set({ report, error: null }),
+  setReport: (report) => set({ report, error: null, loading: false }),
   setTarget: (target) => set({ target }),
   setLoading: (loading) => set({ loading }),
   setError: (error) => set({ error, loading: false }),
@@ -162,6 +163,53 @@ export const useBatchStore = create<BatchStore>((set) => ({
 }));
 
 // ---------------------------------------------------------------------------
+// Chat Store (AI Chatbot - Full Page)
+// ---------------------------------------------------------------------------
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  timestamp: string;
+}
+
+export interface ChatReportOption {
+  scanId: string;
+  target: string;
+  score: number | null;
+  platform: string | null;
+  createdAt: string;
+}
+
+interface ChatStore {
+  messages: ChatMessage[];
+  mode: "developer" | "management";
+  loading: boolean;
+  selectedScanId: string | null;
+  availableReports: ChatReportOption[];
+  setMode: (mode: "developer" | "management") => void;
+  addMessage: (message: ChatMessage) => void;
+  setLoading: (loading: boolean) => void;
+  clearMessages: () => void;
+  setSelectedScanId: (scanId: string | null) => void;
+  setAvailableReports: (reports: ChatReportOption[]) => void;
+}
+
+export const useChatStore = create<ChatStore>((set) => ({
+  messages: [],
+  mode: "developer",
+  loading: false,
+  selectedScanId: null,
+  availableReports: [],
+  setMode: (mode) => set({ mode }),
+  addMessage: (message) =>
+    set((state) => ({ messages: [...state.messages, message] })),
+  setLoading: (loading) => set({ loading }),
+  clearMessages: () => set({ messages: [] }),
+  setSelectedScanId: (selectedScanId) => set({ selectedScanId }),
+  setAvailableReports: (availableReports) => set({ availableReports }),
+}));
+
+// ---------------------------------------------------------------------------
 // UI Preferences
 // ---------------------------------------------------------------------------
 interface UIStore {
@@ -182,3 +230,47 @@ export const useUIStore = create<UIStore>()(
     { name: "vzy-ui" },
   ),
 );
+
+// ---------------------------------------------------------------------------
+// Competition Analysis Store
+// ---------------------------------------------------------------------------
+export type CompareViewMode = "summary" | "technical" | "management";
+
+interface ComparisonStore {
+  result: ComparisonResult | null;
+  primaryUrl: string;
+  competitorUrls: string[];
+  viewMode: CompareViewMode;
+  loading: boolean;
+  error: string | null;
+  scanProgress: Record<string, string>;
+  setResult: (result: ComparisonResult) => void;
+  setPrimaryUrl: (url: string) => void;
+  setCompetitorUrls: (urls: string[]) => void;
+  setViewMode: (mode: CompareViewMode) => void;
+  setLoading: (loading: boolean) => void;
+  setError: (error: string | null) => void;
+  updateScanProgress: (url: string, status: string) => void;
+  reset: () => void;
+}
+
+export const useComparisonStore = create<ComparisonStore>((set) => ({
+  result: null,
+  primaryUrl: "https://www.vzy.one/",
+  competitorUrls: [],
+  viewMode: "summary",
+  loading: false,
+  error: null,
+  scanProgress: {},
+  setResult: (result) => set({ result, error: null, loading: false }),
+  setPrimaryUrl: (primaryUrl) => set({ primaryUrl }),
+  setCompetitorUrls: (competitorUrls) => set({ competitorUrls }),
+  setViewMode: (viewMode) => set({ viewMode }),
+  setLoading: (loading) => set({ loading }),
+  setError: (error) => set({ error, loading: false }),
+  updateScanProgress: (url, status) =>
+    set((state) => ({
+      scanProgress: { ...state.scanProgress, [url]: status },
+    })),
+  reset: () => set({ result: null, error: null, loading: false, scanProgress: {}, competitorUrls: [] }),
+}));

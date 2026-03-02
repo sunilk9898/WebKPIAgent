@@ -418,6 +418,7 @@ export interface ScanReport {
   executiveSummary: string;        // AI-generated summary
   criticalFindings: Finding[];
   recommendations: Recommendation[];
+  enhancedRecommendations?: EnhancedRecommendation[];
   comparisonWithPrevious?: ScanComparison;
 }
 
@@ -428,6 +429,18 @@ export interface Recommendation {
   impact: string;
   effort: 'low' | 'medium' | 'high';
   category: AgentType;
+}
+
+export interface EnhancedRecommendation extends Recommendation {
+  impactScore: number;           // 1-10 (higher = more impact)
+  riskScore: number;             // 1-10 (higher = more risk if not fixed)
+  easeScore: number;             // 1-10 (higher = easier to fix)
+  projectedScoreGain: number;    // Estimated points gained if fixed
+  confidence: number;            // 0-1 confidence level
+  quickWin: boolean;             // true if high-impact + low-effort
+  affectedMetric: string;        // e.g., "Security Score", "LCP", etc.
+  currentValue?: string;         // e.g., "3.2s"
+  targetValue?: string;          // e.g., "<2.5s"
 }
 
 export interface ScanComparison {

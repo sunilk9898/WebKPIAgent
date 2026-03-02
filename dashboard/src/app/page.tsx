@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import {
   Shield, Gauge, Code2, AlertTriangle, TrendingUp, TrendingDown, Minus,
-  Clock, BarChart3, ArrowRight, Loader2, CheckCircle2, XCircle, List,
+  Clock, BarChart3, ArrowRight, Loader2, CheckCircle2, XCircle, List, StopCircle,
 } from "lucide-react";
 import Link from "next/link";
 import { KPIGauge } from "@/components/charts/kpi-gauge";
@@ -15,20 +15,35 @@ import { RegressionBanner } from "@/components/cards/regression-banner";
 import { FindingRow } from "@/components/cards/finding-row";
 import { ScanInput } from "@/components/shared/scan-input";
 import { useScanReport } from "@/hooks/use-scan-report";
-import { getTrends, triggerBatchScan, getLatestReport, type TrendPoint } from "@/lib/api";
+import { getTrends, triggerBatchScan, getLatestReport, abortScan, type TrendPoint } from "@/lib/api";
+import { AIRecommendationsPanel } from "@/components/panels/ai-recommendations-panel";
+import { ExecutiveSummary } from "@/components/shared/executive-summary";
 import { cn, timeAgo, getScoreStatus } from "@/lib/utils";
-import { useUIStore, useBatchStore, useReportStore, type BatchScanEntry } from "@/lib/store";
+import { useUIStore, useBatchStore, useReportStore, useScanStore, type BatchScanEntry } from "@/lib/store";
 import { onBatchProgress, onBatchComplete } from "@/lib/websocket";
 
 export default function OverviewPage() {
   const {
-    report, target, loading, error, findingsBySeverity,
+    report, target, loading, error, activeScan, findingsBySeverity,
     setTarget, startScan, refresh,
   } = useScanReport();
 
+  const { setActiveScan } = useScanStore();
   const { trendRange, setTrendRange } = useUIStore();
   const { batchScans, batchRunning, startBatch, updateBatchEntry, clearBatch } = useBatchStore();
   const [trendData, setTrendData] = useState<TrendPoint[]>([]);
+  const [elapsed, setElapsed] = useState(0);
+
+  // Elapsed timer for active scan
+  useEffect(() => {
+    if (!activeScan) { setElapsed(0); return; }
+    const start = new Date(activeScan.startedAt).getTime();
+    setElapsed(Math.floor((Date.now() - start) / 1000));
+    const interval = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - start) / 1000));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [activeScan]);
 
   // Load a specific URL's report into the global store (used by all sub-pages)
   const loadReportForUrl = async (url: string) => {
@@ -52,6 +67,8 @@ export default function OverviewPage() {
   };
 
   // Listen for batch WebSocket events
+  // IMPORTANT: No `target` in deps — reading from store directly prevents
+  // listener re-registration that can miss events during scan completions.
   useEffect(() => {
     const unsubProgress = onBatchProgress((data) => {
       updateBatchEntry(data.scanId, {
@@ -60,7 +77,8 @@ export default function OverviewPage() {
         error: data.error,
       });
       // Auto-load the first completed URL's report so sub-pages have data
-      if (data.status === "completed" && data.url && !target) {
+      const currentTarget = useReportStore.getState().target;
+      if (data.status === "completed" && data.url && !currentTarget) {
         loadReportForUrl(data.url);
       }
     });
@@ -76,7 +94,8 @@ export default function OverviewPage() {
       unsubProgress();
       unsubComplete();
     };
-  }, [updateBatchEntry, target]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [updateBatchEntry]);
 
   // Load trend data
   useEffect(() => {
@@ -112,7 +131,93 @@ export default function OverviewPage() {
     );
   }
 
-  // ── Loading state ──
+  // ── Active scan in progress: show live progress ──
+  if (activeScan && !report) {
+    const agentLabels: Record<string, { label: string; icon: typeof Shield }> = {
+      security: { label: "Security Agent", icon: Shield },
+      performance: { label: "Performance Agent", icon: Gauge },
+      "code-quality": { label: "Code Quality Agent", icon: Code2 },
+      "report-generator": { label: "Report Generator", icon: BarChart3 },
+    };
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+
+    return (
+      <div className="max-w-xl mx-auto mt-16 space-y-6">
+        <div className="text-center space-y-3">
+          <div className="w-20 h-20 border-4 border-brand-500/30 border-t-brand-500 rounded-full animate-spin mx-auto" />
+          <h1 className="text-2xl font-bold text-gradient mt-4">Scanning in Progress</h1>
+          <p className="text-gray-400 text-sm truncate max-w-md mx-auto">{target}</p>
+        </div>
+
+        <div className="card p-5 space-y-4">
+          <div className="flex items-center justify-between text-xs text-gray-500">
+            <span>Scan ID: {activeScan.scanId.slice(0, 8)}...</span>
+            <span className="font-mono">{mins}:{secs.toString().padStart(2, "0")} elapsed</span>
+          </div>
+
+          {Object.entries(activeScan.agents).map(([key, agent]) => {
+            const info = agentLabels[key] || { label: key, icon: Shield };
+            const Icon = info.icon;
+            return (
+              <div key={key} className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Icon className="w-3.5 h-3.5 text-gray-400" />
+                    <span className="text-xs font-medium text-gray-300">{info.label}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {agent.status === "running" && <Loader2 className="w-3 h-3 text-brand-400 animate-spin" />}
+                    {agent.status === "completed" && <CheckCircle2 className="w-3 h-3 text-green-400" />}
+                    {agent.status === "failed" && <XCircle className="w-3 h-3 text-red-400" />}
+                    <span className={cn(
+                      "text-[10px] font-medium",
+                      agent.status === "running" ? "text-brand-400" :
+                      agent.status === "completed" ? "text-green-400" :
+                      agent.status === "failed" ? "text-red-400" :
+                      "text-gray-500",
+                    )}>
+                      {agent.status === "queued" ? "Waiting..." :
+                       agent.status === "running" ? `${agent.progress}%` :
+                       agent.status === "completed" ? "Done" : agent.status}
+                    </span>
+                  </div>
+                </div>
+                <div className="w-full h-1.5 bg-surface-4 rounded-full overflow-hidden">
+                  <div
+                    className={cn(
+                      "h-full rounded-full transition-all duration-700",
+                      agent.status === "completed" ? "bg-green-500" :
+                      agent.status === "running" ? "bg-brand-500" :
+                      agent.status === "failed" ? "bg-red-500" :
+                      "bg-gray-700",
+                    )}
+                    style={{ width: `${agent.status === "completed" ? 100 : agent.progress}%` }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+
+          <button
+            onClick={async () => {
+              try { await abortScan(activeScan.scanId); } catch {}
+              setActiveScan(null);
+              useReportStore.getState().setLoading(false);
+            }}
+            className="btn w-full mt-2 text-red-400 hover:bg-red-500/10 border border-red-500/20 transition-colors"
+          >
+            <StopCircle className="w-4 h-4" /> Abort Scan
+          </button>
+        </div>
+
+        {/* Batch progress tracker */}
+        {batchScans.length > 0 && <BatchProgressPanel batchScans={batchScans} batchRunning={batchRunning} clearBatch={clearBatch} onSelectUrl={loadReportForUrl} activeUrl={target} />}
+      </div>
+    );
+  }
+
+  // ── Loading state (fetching existing report) ──
   if (loading && !report) {
     return (
       <div className="flex items-center justify-center h-[60vh]">
@@ -124,7 +229,7 @@ export default function OverviewPage() {
     );
   }
 
-  // ── Error state ──
+  // ── Error state (no report found, no active scan) ──
   if (error && !report) {
     return (
       <div className="max-w-xl mx-auto mt-20 space-y-6">
@@ -267,11 +372,11 @@ export default function OverviewPage() {
       </div>
 
       {/* ── Bottom Row: Findings + Severity Distribution ── */}
-      <div className="grid grid-cols-12 gap-6">
-        {/* Critical Findings List */}
-        <div className="col-span-12 lg:col-span-8">
-          <div className="card">
-            <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
+      <div className="grid grid-cols-12 gap-6 items-stretch">
+        {/* Critical Findings List — stretches to match right column */}
+        <div className="col-span-12 lg:col-span-8 flex flex-col">
+          <div className="card flex flex-col flex-1 min-h-0">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06] shrink-0">
               <h2 className="text-sm font-semibold text-gray-200">
                 Critical & High Findings ({report.criticalFindings.length})
               </h2>
@@ -279,13 +384,13 @@ export default function OverviewPage() {
                 View all <ArrowRight className="w-3 h-3" />
               </Link>
             </div>
-            <div className="max-h-[400px] overflow-y-auto">
+            <div className="flex-1 overflow-y-auto">
               {report.criticalFindings.length === 0 ? (
                 <div className="p-8 text-center text-sm text-gray-500">
                   No critical or high findings. Great job!
                 </div>
               ) : (
-                report.criticalFindings.slice(0, 10).map((f) => (
+                report.criticalFindings.slice(0, 15).map((f) => (
                   <FindingRow key={f.id} finding={f} />
                 ))
               )}
@@ -293,50 +398,25 @@ export default function OverviewPage() {
           </div>
         </div>
 
-        {/* Severity Distribution */}
-        <div className="col-span-12 lg:col-span-4">
+        {/* Severity Distribution + Executive Summary */}
+        <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">
           <div className="card p-5">
             <h2 className="text-sm font-semibold text-gray-200 mb-2">Severity Distribution</h2>
             <SeverityPie data={findingsBySeverity} />
           </div>
 
           {/* Executive Summary */}
-          <div className="card p-5 mt-6">
-            <h2 className="text-sm font-semibold text-gray-200 mb-2">Executive Summary</h2>
-            <p className="text-xs text-gray-400 leading-relaxed">{report.executiveSummary}</p>
-          </div>
+          <ExecutiveSummary text={report.executiveSummary} maxLines={5} />
         </div>
       </div>
 
-      {/* ── Recommendations ── */}
+      {/* ── AI-Powered Recommendations ── */}
       {report.recommendations.length > 0 && (
-        <div className="card p-5">
-          <h2 className="text-sm font-semibold text-gray-200 mb-4">Top Recommendations</h2>
-          <div className="space-y-3">
-            {report.recommendations.slice(0, 5).map((r) => (
-              <div key={r.priority} className="flex items-start gap-4 p-3 rounded-lg bg-surface-1">
-                <div className="flex-shrink-0 w-7 h-7 rounded-full bg-brand-600/20 text-brand-400 flex items-center justify-center text-xs font-bold">
-                  {r.priority}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium text-gray-200">{r.title}</div>
-                  <div className="text-xs text-gray-400 mt-0.5">{r.description}</div>
-                  <div className="flex items-center gap-3 mt-2">
-                    <span className="text-[10px] text-gray-500 uppercase">Impact: {r.impact}</span>
-                    <span className={cn(
-                      "badge text-[10px]",
-                      r.effort === "low" ? "bg-green-500/15 text-green-400 border-green-500/30"
-                      : r.effort === "medium" ? "bg-amber-500/15 text-amber-400 border-amber-500/30"
-                      : "bg-red-500/15 text-red-400 border-red-500/30",
-                    )}>
-                      Effort: {r.effort}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
+        <AIRecommendationsPanel
+          recommendations={report.recommendations}
+          enhancedRecommendations={report.enhancedRecommendations}
+          kpiScore={kpi}
+        />
       )}
 
       {/* Batch progress tracker (shown when report is loaded too) */}

@@ -10,6 +10,8 @@ import {
   Settings2,
   FileBarChart,
   Users,
+  MessageSquare,
+  GitCompareArrows,
   ChevronLeft,
   ChevronRight,
   Zap,
@@ -33,6 +35,8 @@ const NAV_ITEMS: NavItem[] = [
   { label: "Control Center",  href: "/control-center",  icon: Settings2,       roles: ["admin", "devops"] },
   { label: "Users",           href: "/users",           icon: Users,           roles: ["admin"] },
   { label: "Reporting",       href: "/reporting",       icon: FileBarChart,    roles: ["admin", "devops", "developer", "executive"] },
+  { label: "Competition",     href: "/competition",     icon: GitCompareArrows, roles: ["admin", "devops", "developer", "executive"] },
+  { label: "AI Chat",         href: "/chat",            icon: MessageSquare,   roles: ["admin", "devops", "developer", "executive"] },
 ];
 
 export function Sidebar() {

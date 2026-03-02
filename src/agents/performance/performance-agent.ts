@@ -1,6 +1,17 @@
 // ============================================================================
 // Performance Agent - Lighthouse, Core Web Vitals, Player Metrics, CDN
 // ============================================================================
+//
+// Scoring model (v2 — Lighthouse-aligned):
+//   Lighthouse Score:       75 points  (directly proportional to raw LH score)
+//   Player Metrics:         10 points  (OTT-specific startup, ABR)
+//   CDN Efficiency:          8 points  (cache headers, compression)
+//   Resource Optimization:   7 points  (page weight, render-blocking)
+//   TOTAL:                 100 points
+//
+// This ensures the VZY Performance Score closely tracks the Lighthouse
+// performance score while still accounting for OTT-specific factors.
+// ============================================================================
 
 import puppeteer, { Browser, Page } from 'puppeteer';
 import lighthouse from 'lighthouse';
@@ -26,16 +37,73 @@ const THRESHOLDS = {
   timeToFirstFrame: 4000, // ms
 };
 
+// ── Lighthouse configuration matching Chrome DevTools defaults exactly ──
+// Source: lighthouse/core/config/desktop-config.js (Lighthouse 12.x)
+const LIGHTHOUSE_DESKTOP_CONFIG = {
+  extends: 'lighthouse:default' as const,
+  settings: {
+    formFactor: 'desktop' as const,
+    throttling: {
+      rttMs: 40,
+      throughputKbps: 10240,
+      cpuSlowdownMultiplier: 1,
+      requestLatencyMs: 0,
+      downloadThroughputKbps: 0,
+      uploadThroughputKbps: 0,
+    },
+    screenEmulation: {
+      mobile: false,
+      width: 1350,
+      height: 940,
+      deviceScaleFactor: 1,
+      disabled: false,
+    },
+    emulatedUserAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+    onlyCategories: ['performance', 'accessibility', 'best-practices', 'seo'],
+    // maxWaitForLoad — use Lighthouse default (45s) for stability
+  },
+};
+
+const LIGHTHOUSE_MOBILE_CONFIG = {
+  extends: 'lighthouse:default' as const,
+  settings: {
+    formFactor: 'mobile' as const,
+    throttling: {
+      rttMs: 150,
+      throughputKbps: 1638.4,
+      cpuSlowdownMultiplier: 4,
+      requestLatencyMs: 562.5,
+      downloadThroughputKbps: 1474.56,
+      uploadThroughputKbps: 675,
+    },
+    screenEmulation: {
+      mobile: true,
+      width: 375,
+      height: 812,
+      deviceScaleFactor: 3,
+      disabled: false,
+    },
+    emulatedUserAgent: 'Mozilla/5.0 (Linux; Android 11; moto g power (2022)) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36',
+    onlyCategories: ['performance', 'accessibility', 'best-practices', 'seo'],
+  },
+};
+
+// Max retry attempts for Lighthouse when it returns 0/null
+const LIGHTHOUSE_MAX_RETRIES = 2;
+
 export class PerformanceAgent extends BaseAgent {
   private browser?: Browser;
   private chrome?: chromeLauncher.LaunchedChrome;
 
-  // ── Metric collectors for metadata ──
-  private _lhScores: { performance: number; accessibility: number; bestPractices: number; seo: number } | null = null;
-  private _cwvValues: Record<string, { value: number; rating: 'good' | 'needs-improvement' | 'poor' }> = {};
+  // ── Metric collectors for metadata (per-platform to avoid overwrite) ──
+  private _lhScoresMap: Record<string, { performance: number; accessibility: number; bestPractices: number; seo: number }> = {};
+  private _cwvValuesMap: Record<string, Record<string, { value: number; rating: 'good' | 'needs-improvement' | 'poor' }>> = {};
   private _playerMetrics: Record<string, number> = {};
   private _resourceData: { totalSize: number; jsSize: number; cssSize: number; imageSize: number; fontSize: number; thirdPartySize: number; requestCount: number; renderBlocking: string[] } | null = null;
   private _cdnStats: { hits: number; total: number; latencies: number[]; compressed: number; uncompressed: number } = { hits: 0, total: 0, latencies: [], compressed: 0, uncompressed: 0 };
+
+  // Track CDN issues by type (grouped) instead of per-asset
+  private _cdnIssues: { missingCache: string[]; uncompressed: string[] } = { missingCache: [], uncompressed: [] };
 
   constructor() {
     super('performance');
@@ -47,7 +115,7 @@ export class PerformanceAgent extends BaseAgent {
         '--headless',
         '--no-sandbox',
         '--disable-gpu',
-        ...(config.platform === 'mweb' ? ['--window-size=375,812'] : ['--window-size=1440,900']),
+        '--disable-dev-shm-usage',
       ],
     });
   }
@@ -56,10 +124,11 @@ export class PerformanceAgent extends BaseAgent {
     const url = config.target.url!;
     const platforms: Platform[] = config.platform === 'both' ? ['desktop', 'mweb'] : [config.platform];
 
+    // Platform-specific analyses (Lighthouse, CWV, Player)
     for (const platform of platforms) {
       this.logger.info(`Running performance scan for ${platform}`);
 
-      // Phase 1: Lighthouse audit
+      // Phase 1: Lighthouse audit (with retry on failure)
       await this.runLighthouse(url, platform);
 
       // Phase 2: Core Web Vitals (real measurement)
@@ -67,14 +136,17 @@ export class PerformanceAgent extends BaseAgent {
 
       // Phase 3: OTT Player Metrics
       await this.measurePlayerMetrics(url, platform);
-
-      // Phase 4: CDN & Resource Analysis
-      await this.analyzeCDN(url);
-      await this.analyzeResources(url);
     }
 
-    // Phase 5: Populate structured metadata for dashboard
-    this.populateMetadata();
+    // Phase 4: CDN & Resource Analysis — run ONCE (platform-independent)
+    await this.analyzeCDN(url);
+    await this.analyzeResources(url);
+
+    // Phase 5: Generate grouped CDN findings (instead of per-asset)
+    this.generateGroupedCDNFindings(url);
+
+    // Phase 6: Populate structured metadata for dashboard
+    this.populateMetadata(platforms);
   }
 
   protected async teardown(): Promise<void> {
@@ -84,89 +156,137 @@ export class PerformanceAgent extends BaseAgent {
   }
 
   // ---------------------------------------------------------------------------
-  // Lighthouse Audit
+  // Lighthouse Audit (with retry logic for reliability)
   // ---------------------------------------------------------------------------
   private async runLighthouse(url: string, platform: Platform): Promise<void> {
     this.logger.info(`Running Lighthouse for ${platform}`);
 
     if (!this.chrome) return;
 
-    const config = {
-      extends: 'lighthouse:default',
-      settings: {
-        formFactor: platform === 'mweb' ? 'mobile' as const : 'desktop' as const,
-        throttling: platform === 'mweb'
-          ? { rttMs: 150, throughputKbps: 1638.4, cpuSlowdownMultiplier: 4 }     // 4G sim
-          : { rttMs: 40, throughputKbps: 10240, cpuSlowdownMultiplier: 1 },       // Desktop
-        screenEmulation: platform === 'mweb'
-          ? { mobile: true, width: 375, height: 812, deviceScaleFactor: 3 }
-          : { mobile: false, width: 1440, height: 900, deviceScaleFactor: 1 },
-        onlyCategories: ['performance', 'accessibility', 'best-practices', 'seo'],
-      },
-    };
+    // Use exact Chrome DevTools config to ensure score alignment
+    const config = platform === 'mweb' ? LIGHTHOUSE_MOBILE_CONFIG : LIGHTHOUSE_DESKTOP_CONFIG;
 
-    try {
-      const result = await lighthouse(url, {
-        port: this.chrome.port,
-        output: 'json',
-        logLevel: 'error',
-      }, config);
+    let lastError: string | null = null;
 
-      if (!result?.lhr) return;
+    for (let attempt = 1; attempt <= LIGHTHOUSE_MAX_RETRIES; attempt++) {
+      try {
+        const result = await lighthouse(url, {
+          port: this.chrome.port,
+          output: 'json',
+          logLevel: 'error',
+        }, config);
 
-      const lhr = result.lhr;
-      const perfScore = (lhr.categories.performance?.score || 0) * 100;
+        if (!result?.lhr) {
+          lastError = 'Lighthouse returned no result';
+          this.logger.warn(`Lighthouse attempt ${attempt}/${LIGHTHOUSE_MAX_RETRIES}: no LHR returned for ${platform}`);
+          continue;
+        }
 
-      // Store scores for metadata
-      this._lhScores = {
-        performance: perfScore,
-        accessibility: (lhr.categories.accessibility?.score || 0) * 100,
-        bestPractices: (lhr.categories['best-practices']?.score || 0) * 100,
-        seo: (lhr.categories.seo?.score || 0) * 100,
-      };
+        const lhr = result.lhr;
+        // Round to avoid floating point artifacts (0.57 * 100 = 56.999... → 57)
+        const perfScore = Math.round((lhr.categories.performance?.score || 0) * 100);
 
-      // Check against target
-      if (perfScore < THRESHOLDS.lighthouseScore) {
-        this.addFinding({
-          severity: perfScore < 50 ? 'critical' : perfScore < 80 ? 'high' : 'medium',
-          category: 'Lighthouse',
-          title: `Lighthouse performance score: ${perfScore} (target: ${THRESHOLDS.lighthouseScore})`,
-          description: `${platform} Lighthouse performance score is ${perfScore}/100, below the target of ${THRESHOLDS.lighthouseScore}.`,
-          location: { url },
-          evidence: JSON.stringify({
-            performance: perfScore,
-            accessibility: (lhr.categories.accessibility?.score || 0) * 100,
-            bestPractices: (lhr.categories['best-practices']?.score || 0) * 100,
-            seo: (lhr.categories.seo?.score || 0) * 100,
-          }),
-          remediation: this.generateLighthouseRemediation(lhr),
-          references: [],
-          autoFixable: false,
-        });
+        // ── Detect Lighthouse failure: score of 0 likely means scan didn't complete ──
+        if (perfScore === 0 && attempt < LIGHTHOUSE_MAX_RETRIES) {
+          this.logger.warn(`Lighthouse attempt ${attempt}/${LIGHTHOUSE_MAX_RETRIES}: performance score is 0 for ${platform}, retrying...`);
+          // Kill and relaunch Chrome for a fresh connection
+          await this.chrome.kill();
+          this.chrome = await chromeLauncher.launch({
+            chromeFlags: ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
+          });
+          continue;
+        }
+
+        // If still 0 after retries, log as a scan failure
+        if (perfScore === 0) {
+          this.logger.error(`Lighthouse failed: performance score is 0 after ${LIGHTHOUSE_MAX_RETRIES} attempts for ${platform}`);
+          this.addFinding({
+            severity: 'info',
+            category: 'Lighthouse',
+            title: `Lighthouse scan incomplete for ${platform}`,
+            description: `Lighthouse could not calculate a performance score for ${platform}. The score returned was 0, indicating the page may have blocked the scan, timed out, or failed to load.`,
+            location: { url },
+            evidence: `Score: 0 after ${LIGHTHOUSE_MAX_RETRIES} attempts`,
+            remediation: 'Check if the site blocks headless Chrome. Try running Chrome DevTools Lighthouse manually to compare.',
+            references: [],
+            autoFixable: false,
+          });
+          // Don't store 0 — let fallback to other platform's score in calculateScore()
+          return;
+        }
+
+        // Store scores per-platform for metadata (avoids mobile overwriting desktop)
+        this._lhScoresMap[platform] = {
+          performance: perfScore,
+          accessibility: Math.round((lhr.categories.accessibility?.score || 0) * 100),
+          bestPractices: Math.round((lhr.categories['best-practices']?.score || 0) * 100),
+          seo: Math.round((lhr.categories.seo?.score || 0) * 100),
+        };
+
+        this.logger.info(`Lighthouse ${platform}: Performance=${perfScore}, Accessibility=${this._lhScoresMap[platform].accessibility}, BestPractices=${this._lhScoresMap[platform].bestPractices}, SEO=${this._lhScoresMap[platform].seo}`);
+
+        // Check against target
+        if (perfScore < THRESHOLDS.lighthouseScore) {
+          this.addFinding({
+            severity: perfScore < 50 ? 'critical' : perfScore < 80 ? 'high' : 'medium',
+            category: 'Lighthouse',
+            title: `Lighthouse performance score: ${perfScore} (target: ${THRESHOLDS.lighthouseScore})`,
+            description: `${platform} Lighthouse performance score is ${perfScore}/100, below the target of ${THRESHOLDS.lighthouseScore}.`,
+            location: { url },
+            evidence: JSON.stringify({
+              performance: perfScore,
+              accessibility: this._lhScoresMap[platform].accessibility,
+              bestPractices: this._lhScoresMap[platform].bestPractices,
+              seo: this._lhScoresMap[platform].seo,
+            }),
+            remediation: this.generateLighthouseRemediation(lhr),
+            references: [],
+            autoFixable: false,
+          });
+        }
+
+        // Extract individual audit failures
+        const failedAudits = Object.values(lhr.audits)
+          .filter((audit: any) => audit.score !== null && audit.score < 0.9 && audit.scoreDisplayMode === 'numeric')
+          .sort((a: any, b: any) => (a.score || 0) - (b.score || 0))
+          .slice(0, 10);
+
+        for (const audit of failedAudits as any[]) {
+          this.addFinding({
+            severity: audit.score < 0.5 ? 'high' : 'medium',
+            category: 'Lighthouse Audit',
+            title: `[${platform}] ${audit.title}: ${audit.displayValue || 'Failed'}`,
+            description: audit.description?.substring(0, 200) || '',
+            location: { url },
+            evidence: `Score: ${Math.round((audit.score || 0) * 100)}/100`,
+            remediation: audit.description || 'Review Lighthouse audit details for specific recommendations.',
+            references: [],
+            autoFixable: false,
+          });
+        }
+
+        // Success — exit retry loop
+        return;
+      } catch (error) {
+        lastError = String(error);
+        this.logger.warn(`Lighthouse attempt ${attempt}/${LIGHTHOUSE_MAX_RETRIES} failed for ${platform}: ${lastError}`);
+
+        if (attempt < LIGHTHOUSE_MAX_RETRIES) {
+          // Relaunch Chrome for a clean retry
+          try {
+            await this.chrome.kill();
+            this.chrome = await chromeLauncher.launch({
+              chromeFlags: ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
+            });
+          } catch (relaunchErr) {
+            this.logger.error('Failed to relaunch Chrome for retry', { error: String(relaunchErr) });
+          }
+        }
       }
-
-      // Extract individual audit failures
-      const failedAudits = Object.values(lhr.audits)
-        .filter((audit: any) => audit.score !== null && audit.score < 0.9 && audit.scoreDisplayMode === 'numeric')
-        .sort((a: any, b: any) => (a.score || 0) - (b.score || 0))
-        .slice(0, 10);
-
-      for (const audit of failedAudits as any[]) {
-        this.addFinding({
-          severity: audit.score < 0.5 ? 'high' : 'medium',
-          category: 'Lighthouse Audit',
-          title: `[${platform}] ${audit.title}: ${audit.displayValue || 'Failed'}`,
-          description: audit.description?.substring(0, 200) || '',
-          location: { url },
-          evidence: `Score: ${Math.round((audit.score || 0) * 100)}/100`,
-          remediation: audit.description || 'Review Lighthouse audit details for specific recommendations.',
-          references: [],
-          autoFixable: false,
-        });
-      }
-    } catch (error) {
-      this.logger.error('Lighthouse scan failed', { error: String(error) });
     }
+
+    // All retries exhausted
+    this.logger.error(`Lighthouse scan failed after ${LIGHTHOUSE_MAX_RETRIES} attempts`, { error: lastError });
   }
 
   // ---------------------------------------------------------------------------
@@ -179,7 +299,8 @@ export class PerformanceAgent extends BaseAgent {
       headless: true,
       args: [
         '--no-sandbox',
-        ...(platform === 'mweb' ? ['--window-size=375,812'] : ['--window-size=1440,900']),
+        '--disable-dev-shm-usage',
+        ...(platform === 'mweb' ? ['--window-size=375,812'] : ['--window-size=1350,940']),
       ],
     });
 
@@ -190,7 +311,7 @@ export class PerformanceAgent extends BaseAgent {
         await page.setViewport({ width: 375, height: 812, isMobile: true, deviceScaleFactor: 3 });
         await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15');
       } else {
-        await page.setViewport({ width: 1440, height: 900, deviceScaleFactor: 1 });
+        await page.setViewport({ width: 1350, height: 940, deviceScaleFactor: 1 });
       }
 
       // Inject web-vitals measurement
@@ -245,7 +366,7 @@ export class PerformanceAgent extends BaseAgent {
       const rateMetric = (val: number, good: number, poor: number): 'good' | 'needs-improvement' | 'poor' =>
         val <= good ? 'good' : val <= poor ? 'needs-improvement' : 'poor';
 
-      this._cwvValues = {
+      this._cwvValuesMap[platform] = {
         lcp: { value: webVitals.lcp || 0, rating: rateMetric(webVitals.lcp || 0, 2500, 4000) },
         fcp: { value: paintTimings.fcp || 0, rating: rateMetric(paintTimings.fcp || 0, 1800, 3000) },
         cls: { value: webVitals.cls || 0, rating: rateMetric(webVitals.cls || 0, 0.1, 0.25) },
@@ -255,9 +376,7 @@ export class PerformanceAgent extends BaseAgent {
       };
 
       for (const metric of metrics) {
-        const isOverThreshold = metric.name === 'CLS'
-          ? metric.value > metric.threshold
-          : metric.value > metric.threshold;
+        const isOverThreshold = metric.value > metric.threshold;
 
         if (isOverThreshold && metric.value > 0) {
           const severity: Severity = metric.value > metric.threshold * 2 ? 'critical'
@@ -287,7 +406,7 @@ export class PerformanceAgent extends BaseAgent {
   private async measurePlayerMetrics(url: string, platform: Platform): Promise<void> {
     this.logger.info('Measuring OTT player metrics');
 
-    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required'] });
+    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required'] });
 
     try {
       const page = await browser.newPage();
@@ -404,43 +523,32 @@ export class PerformanceAgent extends BaseAgent {
   }
 
   // ---------------------------------------------------------------------------
-  // CDN Analysis
+  // CDN Analysis (collects issues, findings generated later as grouped)
   // ---------------------------------------------------------------------------
   private async analyzeCDN(url: string): Promise<void> {
     this.logger.info('Analyzing CDN configuration');
 
-    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
+    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
 
     try {
       const page = await browser.newPage();
 
-      const resourceTimings: { url: string; duration: number; transferSize: number; cached: boolean }[] = [];
-
       page.on('response', async (response) => {
         const headers = response.headers();
-        const url = response.url();
+        const resUrl = response.url();
 
         // Check cache headers
         const cacheControl = headers['cache-control'] || '';
         const cdnHeaders = headers['x-cache'] || headers['x-cdn'] || headers['cf-cache-status'] || '';
 
-        if (url.match(/\.(js|css|png|jpg|jpeg|gif|svg|woff2?|ttf|mp4|m3u8|ts)$/i)) {
+        if (resUrl.match(/\.(js|css|png|jpg|jpeg|gif|svg|woff2?|ttf|mp4|m3u8|ts)$/i)) {
           // Track CDN stats for metadata
           this._cdnStats.total++;
           if (cdnHeaders.toLowerCase().includes('hit')) this._cdnStats.hits++;
 
+          // Collect issues for grouped findings (instead of per-asset)
           if (!cacheControl || cacheControl.includes('no-cache') || cacheControl.includes('no-store')) {
-            this.addFinding({
-              severity: 'medium',
-              category: 'CDN Performance',
-              title: `Missing/weak cache headers: ${new URL(url).pathname.split('/').pop()}`,
-              description: `Static resource lacks proper cache-control headers: "${cacheControl || 'missing'}"`,
-              location: { url },
-              evidence: `Cache-Control: ${cacheControl || 'not set'}`,
-              remediation: 'Set aggressive cache headers for static assets: Cache-Control: public, max-age=31536000, immutable',
-              references: [],
-              autoFixable: true,
-            });
+            this._cdnIssues.missingCache.push(new URL(resUrl).pathname.split('/').pop() || resUrl);
           }
 
           // Check compression
@@ -449,17 +557,7 @@ export class PerformanceAgent extends BaseAgent {
           else this._cdnStats.uncompressed++;
           const contentType = headers['content-type'] || '';
           if (!encoding && (contentType.includes('javascript') || contentType.includes('css') || contentType.includes('html'))) {
-            this.addFinding({
-              severity: 'medium',
-              category: 'CDN Performance',
-              title: `Uncompressed resource: ${new URL(url).pathname.split('/').pop()}`,
-              description: 'Text-based resource is served without compression (gzip/brotli).',
-              location: { url },
-              evidence: `Content-Type: ${contentType}, Content-Encoding: ${encoding || 'none'}`,
-              remediation: 'Enable Brotli (preferred) or gzip compression for all text-based assets at the CDN level.',
-              references: [],
-              autoFixable: true,
-            });
+            this._cdnIssues.uncompressed.push(new URL(resUrl).pathname.split('/').pop() || resUrl);
           }
         }
       });
@@ -471,12 +569,50 @@ export class PerformanceAgent extends BaseAgent {
   }
 
   // ---------------------------------------------------------------------------
+  // Generate grouped CDN findings (1 per issue type, not per asset)
+  // ---------------------------------------------------------------------------
+  private generateGroupedCDNFindings(url: string): void {
+    const { missingCache, uncompressed } = this._cdnIssues;
+
+    if (missingCache.length > 0) {
+      // One grouped finding instead of N individual findings
+      const severity: Severity = missingCache.length > 20 ? 'high' : missingCache.length > 5 ? 'medium' : 'low';
+      this.addFinding({
+        severity,
+        category: 'CDN Performance',
+        title: `${missingCache.length} static assets lack proper cache headers`,
+        description: `Found ${missingCache.length} static resources without adequate Cache-Control headers. These assets are not being cached by browsers or CDN, causing redundant network requests.`,
+        location: { url },
+        evidence: `Affected resources: ${missingCache.slice(0, 5).join(', ')}${missingCache.length > 5 ? ` ... and ${missingCache.length - 5} more` : ''}`,
+        remediation: 'Set aggressive cache headers for static assets: Cache-Control: public, max-age=31536000, immutable',
+        references: [],
+        autoFixable: true,
+      });
+    }
+
+    if (uncompressed.length > 0) {
+      const severity: Severity = uncompressed.length > 10 ? 'high' : uncompressed.length > 3 ? 'medium' : 'low';
+      this.addFinding({
+        severity,
+        category: 'CDN Performance',
+        title: `${uncompressed.length} text assets served without compression`,
+        description: `Found ${uncompressed.length} text-based resources (JS/CSS/HTML) served without gzip/brotli compression.`,
+        location: { url },
+        evidence: `Affected resources: ${uncompressed.slice(0, 5).join(', ')}${uncompressed.length > 5 ? ` ... and ${uncompressed.length - 5} more` : ''}`,
+        remediation: 'Enable Brotli (preferred) or gzip compression for all text-based assets at the CDN level.',
+        references: [],
+        autoFixable: true,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Resource Analysis
   // ---------------------------------------------------------------------------
   private async analyzeResources(url: string): Promise<void> {
     this.logger.info('Analyzing resource loading');
 
-    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
+    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
 
     try {
       const page = await browser.newPage();
@@ -568,20 +704,26 @@ export class PerformanceAgent extends BaseAgent {
   // ---------------------------------------------------------------------------
   // Populate Structured Metadata for Dashboard
   // ---------------------------------------------------------------------------
-  private populateMetadata(): void {
+  private populateMetadata(platforms: Platform[]): void {
     // ── Lighthouse Metrics ──
-    const lighthouse = this._lhScores
+    // Use desktop scores as primary (matches Chrome DevTools); fall back to mobile
+    const primaryLH = this._lhScoresMap['desktop'] || this._lhScoresMap['mweb'] || null;
+    const lighthouseData = primaryLH
       ? {
-          performanceScore: this._lhScores.performance,
-          accessibilityScore: this._lhScores.accessibility,
-          bestPracticesScore: this._lhScores.bestPractices,
-          seoScore: this._lhScores.seo,
+          performanceScore: primaryLH.performance,
+          accessibilityScore: primaryLH.accessibility,
+          bestPracticesScore: primaryLH.bestPractices,
+          seoScore: primaryLH.seo,
           pwaScore: 0,
+          // Include both platforms when available for detailed comparison
+          ...(Object.keys(this._lhScoresMap).length > 1 ? { byPlatform: this._lhScoresMap } : {}),
         }
       : null;
 
     // ── Core Web Vitals ──
-    const coreWebVitals = Object.keys(this._cwvValues).length > 0 ? this._cwvValues : null;
+    // Use desktop CWV as primary; fall back to mobile
+    const primaryCWV = this._cwvValuesMap['desktop'] || this._cwvValuesMap['mweb'] || null;
+    const coreWebVitals = primaryCWV || null;
 
     // ── Player Metrics ──
     const hasPlayer = this._playerMetrics && Object.keys(this._playerMetrics).length > 0;
@@ -622,7 +764,7 @@ export class PerformanceAgent extends BaseAgent {
       : null;
 
     this.metadata = {
-      lighthouse,
+      lighthouse: lighthouseData,
       coreWebVitals,
       playerMetrics,
       cdnMetrics,
@@ -631,70 +773,76 @@ export class PerformanceAgent extends BaseAgent {
   }
 
   // ---------------------------------------------------------------------------
-  // Scoring
+  // Scoring (v2 — Lighthouse-aligned, 75/10/8/7 split)
   // ---------------------------------------------------------------------------
   protected calculateScore(): WeightedScore {
-    // ── Lighthouse-anchored scoring ──
+    // ── Lighthouse-aligned scoring (v2) ──
     //
-    // Chrome Lighthouse already includes CWV metrics (LCP, FCP, CLS, TTFB, TBT, SI)
-    // in its Performance score. If we also penalize CWV separately, we double-count.
+    // Problem solved: VZY Performance Score must closely track Chrome Lighthouse
+    // so users can directly compare the two. Previously, the 60/15/13/12 split
+    // allowed CDN/Resource penalties to push the score far below Lighthouse.
     //
-    // New model: Lighthouse is the PRIMARY driver (60 pts), with OTT-specific
-    // categories (Player, CDN, Resources) as additional checks (40 pts combined).
-    // CWV findings are kept for display but NOT scored separately.
+    // New model: Lighthouse is the DOMINANT driver (75 pts), with OTT-specific
+    // categories adding modest adjustments (25 pts combined).
+    //
+    // Example: Lighthouse 56 → 56% of 75 = 42 pts + OTT bonuses → ~52-57 range
+    // Previously: Lighthouse 56 → 56% of 60 = 33.6 + OTT → ~40 range (too low)
 
-    // 1. LIGHTHOUSE SCORE (60 points) — directly proportional to actual Lighthouse score
-    //    Lighthouse 66 → 66% of 60 = 39.6 pts
-    //    This already accounts for LCP, FCP, CLS, TBT, Speed Index, TTFB
+    // 1. LIGHTHOUSE SCORE (75 points) — directly proportional to actual Lighthouse score
+    //    Use desktop score as primary (matches Chrome DevTools comparison)
+    //    Fall back to mobile if desktop failed
     const lighthouseFindings = this.findings.filter((f) => f.category === 'Lighthouse');
-    let lighthouseActual = 60; // full score if no Lighthouse data
-    if (lighthouseFindings.length > 0) {
-      const mainFinding = lighthouseFindings[0];
-      try {
-        const evidence = JSON.parse(mainFinding.evidence || '{}');
-        const lhScore = evidence.performance || 0;
-        lighthouseActual = Math.round((lhScore / 100) * 60 * 100) / 100;
-      } catch {
-        lighthouseActual = Math.max(0, 60 - 20);
-      }
+    const desktopLH = this._lhScoresMap['desktop']?.performance;
+    const mobileLH = this._lhScoresMap['mweb']?.performance;
+    // Prefer desktop; if desktop is missing (scan failed), use mobile
+    const primaryLHScore = (desktopLH !== undefined && desktopLH > 0)
+      ? desktopLH
+      : (mobileLH !== undefined && mobileLH > 0)
+        ? mobileLH
+        : null;
+
+    let lighthouseActual = 75; // full score if no Lighthouse data at all
+    if (primaryLHScore !== null) {
+      lighthouseActual = Math.round((primaryLHScore / 100) * 75 * 100) / 100;
     }
     const lighthouseAuditFindings = this.findings.filter((f) => f.category === 'Lighthouse Audit');
 
     // 2. CWV — NOT scored (already in Lighthouse). Kept for dashboard display only.
     const cwvFindings = this.findings.filter((f) => f.category === 'Core Web Vitals');
 
-    // 3. PLAYER METRICS (15 points) — OTT-specific, not part of Lighthouse
+    // 3. PLAYER METRICS (10 points) — OTT-specific, not part of Lighthouse
     const playerFindings = this.findings.filter((f) => f.category.includes('Player'));
     const playerPenalty = playerFindings.reduce((sum, f) => {
-      const w = f.severity === 'critical' ? 8 : f.severity === 'high' ? 4 : 2;
+      const w = f.severity === 'critical' ? 6 : f.severity === 'high' ? 3 : 1;
       return sum + w;
     }, 0);
-    const playerActual = Math.max(0, 15 - Math.min(playerPenalty, 15));
+    const playerActual = Math.max(0, 10 - Math.min(playerPenalty, 10));
 
-    // 4. CDN EFFICIENCY (13 points) — OTT-specific (CDN config, cache headers, compression)
+    // 4. CDN EFFICIENCY (8 points) — OTT-specific (CDN config, cache headers, compression)
+    //    Now using grouped findings (max 2-3 findings instead of 40+)
     const cdnFindings = this.findings.filter((f) => f.category.includes('CDN'));
     const cdnPenalty = cdnFindings.reduce((sum, f) => {
-      const w = f.severity === 'critical' ? 5 : f.severity === 'high' ? 3 : 1;
+      const w = f.severity === 'critical' ? 5 : f.severity === 'high' ? 3 : f.severity === 'medium' ? 2 : 1;
       return sum + w;
     }, 0);
-    const cdnActual = Math.max(0, 13 - Math.min(cdnPenalty, 13));
+    const cdnActual = Math.max(0, 8 - Math.min(cdnPenalty, 8));
 
-    // 5. RESOURCE OPTIMIZATION (12 points) — page weight, render-blocking
+    // 5. RESOURCE OPTIMIZATION (7 points) — page weight, render-blocking
     const resourceFindings = this.findings.filter((f) =>
       f.category.includes('Resource') || f.category.includes('Render'),
     );
     const resourcePenalty = resourceFindings.reduce((sum, f) => {
-      const w = f.severity === 'critical' ? 5 : f.severity === 'high' ? 3 : 1;
+      const w = f.severity === 'critical' ? 4 : f.severity === 'high' ? 3 : 1;
       return sum + w;
     }, 0);
-    const resourceActual = Math.max(0, 12 - Math.min(resourcePenalty, 12));
+    const resourceActual = Math.max(0, 7 - Math.min(resourcePenalty, 7));
 
     const breakdown = [
       {
-        metric: 'Lighthouse Score', value: 0, maxScore: 60,
+        metric: 'Lighthouse Score', value: primaryLHScore || 0, maxScore: 75,
         actualScore: lighthouseActual,
-        penalty: Math.round((60 - lighthouseActual) * 100) / 100,
-        details: `${lighthouseFindings.length} finding(s), ${lighthouseAuditFindings.length} audit(s)`,
+        penalty: Math.round((75 - lighthouseActual) * 100) / 100,
+        details: `Raw LH: ${primaryLHScore ?? 'N/A'}/100 → ${lighthouseActual}/75 | ${lighthouseFindings.length} finding(s), ${lighthouseAuditFindings.length} audit(s)`,
       },
       {
         metric: 'Core Web Vitals (info)', value: 0, maxScore: 0,
@@ -703,31 +851,44 @@ export class PerformanceAgent extends BaseAgent {
         details: `${cwvFindings.length} finding(s) — included in Lighthouse score`,
       },
       {
-        metric: 'Player Metrics', value: 0, maxScore: 15,
+        metric: 'Player Metrics', value: 0, maxScore: 10,
         actualScore: playerActual,
-        penalty: Math.min(playerPenalty, 15),
+        penalty: Math.min(playerPenalty, 10),
         details: `${playerFindings.length} finding(s)`,
       },
       {
-        metric: 'CDN Efficiency', value: 0, maxScore: 13,
+        metric: 'CDN Efficiency', value: 0, maxScore: 8,
         actualScore: cdnActual,
-        penalty: Math.min(cdnPenalty, 13),
-        details: `${cdnFindings.length} finding(s)`,
+        penalty: Math.min(cdnPenalty, 8),
+        details: `${cdnFindings.length} grouped finding(s)`,
       },
       {
-        metric: 'Resource Optimization', value: 0, maxScore: 12,
+        metric: 'Resource Optimization', value: 0, maxScore: 7,
         actualScore: resourceActual,
-        penalty: Math.min(resourcePenalty, 12),
+        penalty: Math.min(resourcePenalty, 7),
         details: `${resourceFindings.length} finding(s)`,
       },
     ];
 
     const rawScore = this.clampScore(breakdown.reduce((sum, b) => sum + b.actualScore, 0));
 
+    // Log score breakdown for debugging
+    this.logger.info('Performance score breakdown', {
+      rawScore,
+      lighthouseInput: primaryLHScore,
+      lighthouseActual,
+      playerActual,
+      cdnActual,
+      resourceActual,
+      findingsCount: this.findings.length,
+      cdnFindingsCount: cdnFindings.length,
+      resourceFindingsCount: resourceFindings.length,
+    });
+
     return {
       category: 'performance',
       rawScore,
-      weight: 0.35,    // Performance gets 35% weight
+      weight: 0.35,    // Performance gets 35% weight in overall KPI
       weightedScore: rawScore * 0.35,
       breakdown,
     };

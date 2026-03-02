@@ -3,39 +3,55 @@
 // ============================================================================
 
 import { Pool } from 'pg';
+import Redis from 'ioredis';
 import { Logger } from '../utils/logger';
 import { ScanReport } from '../types';
-
-// Lazy-load ioredis to avoid startup crash when Redis is not configured
-let Redis: any;
-function getRedisClass() {
-  if (!Redis) {
-    try {
-      Redis = require('ioredis').default || require('ioredis');
-    } catch {
-      Redis = null;
-    }
-  }
-  return Redis;
-}
 
 export class ResultStore {
   private logger = new Logger('result-store');
   private pg?: Pool;
-  private redis?: any;
+  private redis?: Redis;
+  private schemaReady = false;
 
   constructor() {
-    // Initialize PostgreSQL if configured
-    if (process.env.DATABASE_URL) {
-      this.pg = new Pool({ connectionString: process.env.DATABASE_URL });
+    // Initialize PostgreSQL — use DATABASE_URL or default local connection
+    const dbUrl = process.env.DATABASE_URL || 'postgresql://vzy:changeme@localhost:5432/vzy_agent';
+    try {
+      this.pg = new Pool({ connectionString: dbUrl, connectionTimeoutMillis: 5000 });
+    } catch (error) {
+      this.logger.warn('Failed to create PostgreSQL pool, falling back to file storage', { error: String(error) });
     }
 
-    // Initialize Redis if configured (lazy-loaded to avoid import crash)
+    // Initialize Redis if configured
     if (process.env.REDIS_URL) {
-      const RedisClass = getRedisClass();
-      if (RedisClass) {
-        this.redis = new RedisClass(process.env.REDIS_URL);
-      }
+      this.redis = new Redis(process.env.REDIS_URL);
+    }
+  }
+
+  // Ensure scan_reports table exists (called lazily on first use)
+  private async ensureSchema(): Promise<void> {
+    if (this.schemaReady || !this.pg) return;
+    try {
+      await this.pg.query(`
+        CREATE TABLE IF NOT EXISTS scan_reports (
+          id VARCHAR(100) PRIMARY KEY,
+          scan_id VARCHAR(100) NOT NULL,
+          target_url TEXT NOT NULL,
+          platform VARCHAR(20) NOT NULL,
+          overall_score DECIMAL(5,2) NOT NULL,
+          security_score DECIMAL(5,2),
+          performance_score DECIMAL(5,2),
+          code_quality_score DECIMAL(5,2),
+          critical_findings_count INTEGER DEFAULT 0,
+          report_json JSONB NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_scan_reports_target ON scan_reports(target_url);
+        CREATE INDEX IF NOT EXISTS idx_scan_reports_date ON scan_reports(created_at DESC);
+      `);
+      this.schemaReady = true;
+    } catch (error) {
+      this.logger.warn('Failed to ensure schema', { error: String(error) });
     }
   }
 
@@ -43,6 +59,8 @@ export class ResultStore {
   // Save Report
   // ---------------------------------------------------------------------------
   async saveReport(report: ScanReport): Promise<void> {
+    await this.ensureSchema();
+
     // Store in PostgreSQL for persistent history
     if (this.pg) {
       try {
@@ -109,6 +127,8 @@ export class ResultStore {
   // Get Latest Report
   // ---------------------------------------------------------------------------
   async getLatestReport(target: string): Promise<ScanReport | null> {
+    await this.ensureSchema();
+
     // Try Redis first
     if (this.redis) {
       try {
@@ -135,7 +155,7 @@ export class ResultStore {
       }
     }
 
-    // Fall back to file system
+    // Fall back to file system — filter by target URL
     try {
       const fs = require('fs');
       const path = require('path');
@@ -147,9 +167,13 @@ export class ResultStore {
         .sort()
         .reverse();
 
-      if (files.length > 0) {
-        const content = fs.readFileSync(path.join(dir, files[0]), 'utf-8');
-        return JSON.parse(content);
+      for (const file of files) {
+        const content = fs.readFileSync(path.join(dir, file), 'utf-8');
+        const report = JSON.parse(content);
+        const reportTarget = report.target?.url || report.target?.repoPath || '';
+        if (reportTarget === target) {
+          return report;
+        }
       }
     } catch {
       // No previous results
@@ -168,7 +192,7 @@ export class ResultStore {
         const since = Date.now() - days * 86400 * 1000;
         const results = await this.redis.zrangebyscore(`trend:${target}`, since, '+inf');
         if (results.length > 0) {
-          return results.map((r: string) => JSON.parse(r));
+          return results.map((r) => JSON.parse(r));
         }
         // Redis returned empty — fall through to PostgreSQL
       } catch {

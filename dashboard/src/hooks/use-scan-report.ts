@@ -3,28 +3,34 @@
 import { useEffect, useCallback } from "react";
 import { useReportStore, useScanStore } from "@/lib/store";
 import { getLatestReport, triggerScan, type ScanRequest } from "@/lib/api";
-import { onScanComplete, onScanError } from "@/lib/websocket";
+import { onScanComplete, onScanError, onScanProgress } from "@/lib/websocket";
 import type { ScanReport, AgentResult } from "@/types/api";
 
 /** Central hook for consuming scan report data */
 export function useScanReport() {
   const { report, target, loading, error, setReport, setTarget, setLoading, setError } = useReportStore();
-  const { activeScan, setActiveScan, completeScan } = useScanStore();
+  const { activeScan, setActiveScan, completeScan, updateAgentProgress } = useScanStore();
 
-  // Reload report
+  // Reload report — reads target from store at call-time so the callback
+  // identity stays stable and WebSocket listeners don't churn on target change.
   const refresh = useCallback(async () => {
-    if (!target) return;
+    const currentTarget = useReportStore.getState().target;
+    if (!currentTarget) return;
     setLoading(true);
     try {
-      const r = await getLatestReport(target);
+      const r = await getLatestReport(currentTarget);
       setReport(r);
     } catch (e: any) {
       setError(e.message);
     }
-  }, [target, setReport, setLoading, setError]);
+  }, [setReport, setLoading, setError]);
 
   // Trigger a new scan
   const startScan = useCallback(async (req: ScanRequest) => {
+    // Always set the target so refresh() works after completion
+    const t = req.url || req.repoPath || "";
+    if (t) setTarget(t);
+
     setLoading(true);
     try {
       const res = await triggerScan(req);
@@ -41,15 +47,20 @@ export function useScanReport() {
       });
       return res;
     } catch (e: any) {
+      setLoading(false);
       setError(e.message);
       throw e;
     }
-  }, [setActiveScan, setLoading, setError]);
+  }, [setActiveScan, setTarget, setLoading, setError]);
 
-  // Listen for scan completion via WebSocket
+  // Listen for scan progress + completion via WebSocket
   useEffect(() => {
+    const unsubProgress = onScanProgress((data) => {
+      updateAgentProgress(data.scanId, data.agent, data.progress, data.status);
+    });
     const unsubComplete = onScanComplete((data) => {
       completeScan(data.scanId, data.score, data.status);
+      setLoading(false); // Always clear loading on completion
       refresh();
     });
     const unsubError = onScanError(() => {
@@ -57,10 +68,11 @@ export function useScanReport() {
       setLoading(false);
     });
     return () => {
+      unsubProgress();
       unsubComplete();
       unsubError();
     };
-  }, [completeScan, setActiveScan, refresh, setLoading]);
+  }, [completeScan, setActiveScan, updateAgentProgress, refresh, setLoading]);
 
   // Derived data helpers
   const securityResult = report?.agentResults.find((r) => r.agentType === "security") || null;

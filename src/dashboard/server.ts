@@ -5,41 +5,39 @@
 import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import helmet from 'helmet';
-import cors from 'cors';
 import { Server } from 'socket.io';
 import http from 'http';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { Pool } from 'pg';
+import OpenAI from 'openai';
 import { Logger } from '../utils/logger';
-
-// ---------------------------------------------------------------------------
-// Lazy-load heavy modules (Puppeteer, Lighthouse, etc.)
-// The Orchestrator imports SecurityAgent/PerformanceAgent which pull in puppeteer
-// at the module level. On hosted platforms without Chromium (Render free tier),
-// this would crash the server at startup. We load them on-demand instead.
-// ---------------------------------------------------------------------------
-function lazyOrchestrator() {
-  const { Orchestrator } = require('../orchestrator');
-  return Orchestrator;
-}
+import { ResultStore } from '../store/result-store';
+import { Orchestrator } from '../orchestrator';
 
 const logger = new Logger('dashboard');
+const store = new ResultStore();
+
+// Prevent Lighthouse / Puppeteer uncaught exceptions from crashing the server
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception (kept alive)', { error: String(err), stack: err.stack?.substring(0, 500) });
+});
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled rejection (kept alive)', { error: String(reason) });
+});
 
 // Track running scans so we can abort them
-const runningScans = new Map<string, { orchestrator: any; abortController: AbortController }>();
+const runningScans = new Map<string, { orchestrator: Orchestrator; abortController: AbortController }>();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'vzy-dashboard-secret-key-2026';
 const JWT_EXPIRES_IN = '24h';
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 
 // ---------------------------------------------------------------------------
 // PostgreSQL Connection
 // ---------------------------------------------------------------------------
 const pg = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://vzy:changeme@localhost:5432/vzy_agent',
-  connectionTimeoutMillis: 5000,   // Fail fast if DB unreachable (prevents server hang)
-  idleTimeoutMillis: 30000,
-  max: 10,
 });
 
 // ---------------------------------------------------------------------------
@@ -50,12 +48,6 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
 app.use(helmet());
-app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
 app.use(express.json());
 app.use(express.static('dashboard-ui'));
 
@@ -377,46 +369,25 @@ app.delete('/api/auth/users/:id', authMiddleware, requireRole('admin'), async (r
 
 // ============================= EXISTING API ENDPOINTS =======================
 
-// Get latest scan report (direct PostgreSQL — no ResultStore/Redis dependency)
+// Get latest scan report
 app.get('/api/reports/latest', async (req, res) => {
   const target = req.query.target as string;
   if (!target) return res.status(400).json({ error: 'target query param required' });
 
-  try {
-    const result = await pg.query(
-      `SELECT report_json FROM scan_reports WHERE target_url = $1 ORDER BY created_at DESC LIMIT 1`,
-      [target],
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'No reports found' });
-    res.json(result.rows[0].report_json);
-  } catch (error) {
-    logger.error('Failed to get latest report', { error: String(error) });
-    res.status(500).json({ error: 'Internal server error' });
-  }
+  const report = await store.getLatestReport(target);
+  if (!report) return res.status(404).json({ error: 'No reports found' });
+  res.json(report);
 });
 
-// Get trend data (direct PostgreSQL)
+// Get trend data
 app.get('/api/trends', async (req, res) => {
   const target = req.query.target as string;
   const days = parseInt(req.query.days as string) || 30;
 
   if (!target) return res.status(400).json({ error: 'target query param required' });
 
-  try {
-    const result = await pg.query(
-      `SELECT created_at as date, overall_score as score,
-              security_score as security, performance_score as performance,
-              code_quality_score as "codeQuality"
-       FROM scan_reports
-       WHERE target_url = $1 AND created_at > NOW() - make_interval(days => $2)
-       ORDER BY created_at`,
-      [target, days],
-    );
-    res.json(result.rows);
-  } catch (error) {
-    logger.error('Failed to get trends', { error: String(error) });
-    res.json([]);
-  }
+  const trend = await store.getTrend(target, days);
+  res.json(trend);
 });
 
 // Trigger manual scan
@@ -427,21 +398,11 @@ app.post('/api/scans', authMiddleware, requireRole('admin', 'devops') as any, as
     return res.status(400).json({ error: 'url or repoPath required' });
   }
 
-  let OrchestratorClass: any;
-  try {
-    OrchestratorClass = lazyOrchestrator();
-  } catch (err) {
-    logger.error('Failed to load orchestrator (Puppeteer/Chromium likely missing)', { error: String(err) });
-    return res.status(503).json({
-      error: 'Scan engine unavailable — Chromium/Puppeteer not installed on this host. Scans require a backend with browser support.',
-    });
-  }
-
-  const config = OrchestratorClass.createConfig({ url, repoPath, agents, platform });
+  const config = Orchestrator.createConfig({ url, repoPath, agents, platform, thresholds: systemConfig.thresholds });
   res.json({ status: 'queued', scanId: config.id });
 
   // Run scan in background with abort support
-  const orchestrator = new OrchestratorClass();
+  const orchestrator = new Orchestrator();
   const abortController = new AbortController();
   runningScans.set(config.id, { orchestrator, abortController });
 
@@ -479,16 +440,6 @@ app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as a
     return res.status(400).json({ error: 'Maximum 20 URLs per batch' });
   }
 
-  let OrchestratorClass: any;
-  try {
-    OrchestratorClass = lazyOrchestrator();
-  } catch (err) {
-    logger.error('Failed to load orchestrator for batch scan', { error: String(err) });
-    return res.status(503).json({
-      error: 'Scan engine unavailable — Chromium/Puppeteer not installed on this host.',
-    });
-  }
-
   const batchId = `batch_${Date.now()}`;
 
   // De-duplicate and trim URLs
@@ -496,7 +447,7 @@ app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as a
 
   // Create configs lazily per URL (avoid sharing state between configs)
   const scanEntries = uniqueUrls.map((url: string) => {
-    const config = OrchestratorClass.createConfig({ url, agents, platform });
+    const config = Orchestrator.createConfig({ url, agents, platform, thresholds: systemConfig.thresholds });
     return { url, scanId: config.id, config, status: 'queued' as string };
   });
 
@@ -524,7 +475,7 @@ app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as a
 
     logger.info(`[Batch ${batchId}] Starting scan ${i + 1}/${scanEntries.length}: ${entry.url}`);
 
-    const orchestrator = new OrchestratorClass();
+    const orchestrator = new Orchestrator();
     const abortController = new AbortController();
     runningScans.set(entry.scanId, { orchestrator, abortController });
 
@@ -749,16 +700,618 @@ app.post('/api/jira/create', authMiddleware as any, requireRole('admin', 'devops
   res.json({ ticketId, url: `${process.env.JIRA_HOST || 'https://dishtv.atlassian.net'}/browse/${ticketId}` });
 });
 
-// Health check (public) — always responds so Render doesn't kill the process
-app.get('/api/health', async (_req, res) => {
-  let dbStatus = 'unknown';
+// ============================= AI CHAT ENDPOINT ==============================
+
+// List available scan reports for chat context selection
+app.get('/api/chat/reports', authMiddleware as any, async (_req: AuthRequest, res: Response) => {
   try {
-    await pg.query('SELECT 1');
-    dbStatus = 'connected';
-  } catch {
-    dbStatus = 'disconnected';
+    const result = await pg.query(
+      `SELECT scan_id, target_url, created_at, overall_score,
+              report_json->'platform' as platform
+       FROM scan_reports ORDER BY created_at DESC LIMIT 20`,
+    );
+    const reports = result.rows.map((r: any) => ({
+      scanId: r.scan_id,
+      target: r.target_url,
+      score: r.overall_score != null ? Number(r.overall_score) : null,
+      platform: r.platform ? String(r.platform).replace(/"/g, '') : null,
+      createdAt: r.created_at,
+    }));
+    res.json({ reports });
+  } catch (error) {
+    logger.error('Chat reports list error', { error: String(error) });
+    res.status(500).json({ error: 'Failed to list reports' });
   }
-  res.json({ status: 'ok', db: dbStatus, uptime: process.uptime(), timestamp: new Date().toISOString() });
+});
+
+app.post('/api/chat', authMiddleware as any, async (req: AuthRequest, res: Response) => {
+  const { message, mode, scanId, history } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: 'message is required' });
+  }
+
+  if (!mode || !['developer', 'management'].includes(mode)) {
+    return res.status(400).json({ error: 'mode must be "developer" or "management"' });
+  }
+
+  try {
+    // Load full scan report context if scanId is provided
+    let reportData: any = null;
+    if (scanId) {
+      const result = await pg.query(
+        'SELECT report_json FROM scan_reports WHERE scan_id = $1',
+        [scanId],
+      );
+      if (result.rows.length > 0) {
+        reportData = result.rows[0].report_json;
+      }
+    }
+
+    // If OpenAI is not configured, return fallback
+    if (!openai) {
+      return res.json({
+        reply: 'AI chat requires an OpenAI API key. Configure OPENAI_API_KEY in your environment to enable the AI assistant.',
+        mode,
+      });
+    }
+
+    // Build rich system prompt based on mode
+    const basePrompt = mode === 'developer'
+      ? `You are an expert OTT platform security and performance analyst assistant.
+Your role: Help developers understand vulnerabilities, performance issues, and code quality problems.
+Response format requirements:
+- Use markdown headings (##, ###) to structure responses
+- Use **bold** for severity levels and key terms
+- Use bullet points for lists
+- Include code blocks with language tags when showing code fixes
+- Tag findings by priority: **[CRITICAL]**, **[HIGH]**, **[MEDIUM]**, **[LOW]**
+- Provide: root cause analysis, remediation steps, code-level suggestions
+- Reference specific findings from the scan report by title
+- Be specific and technical, cite evidence from the report`
+      : `You are an executive briefing assistant for OTT platform risk analysis.
+Your role: Translate technical findings into business language for management.
+Response format requirements:
+- Use markdown headings (##, ###) to structure responses
+- Use **bold** for risk levels and key metrics
+- Structure as: Executive Summary → Risk Classification → Business Impact → Recommendations
+- Tag risks: **[CRITICAL RISK]**, **[HIGH RISK]**, **[MEDIUM RISK]**, **[LOW RISK]**
+- Include estimated financial/customer impact where possible
+- Provide: compliance status, strategic recommendations, priority actions
+- Focus on ROI, customer impact, regulatory exposure
+- Use clear non-technical language`;
+
+    const messages: any[] = [
+      { role: 'system', content: basePrompt },
+    ];
+
+    // Add deep report context if available
+    if (reportData) {
+      const kpi = reportData.kpiScore || {};
+      const grades = kpi.grades || {};
+
+      // Build comprehensive context with all agent data
+      const deepContext: any = {
+        target: reportData.target,
+        platform: reportData.platform,
+        generatedAt: reportData.generatedAt,
+        scores: {
+          overall: kpi.overallScore,
+          passesThreshold: kpi.passesThreshold,
+          security: { raw: grades.security?.rawScore, weighted: grades.security?.weightedScore, weight: '40%' },
+          performance: { raw: grades.performance?.rawScore, weighted: grades.performance?.weightedScore, weight: '35%' },
+          codeQuality: { raw: grades.codeQuality?.rawScore, weighted: grades.codeQuality?.weightedScore, weight: '25%' },
+        },
+        executiveSummary: reportData.executiveSummary,
+        trend: kpi.trend ? { direction: kpi.trend.direction, delta: kpi.trend.delta } : null,
+        regressions: (kpi.regressions || []).map((r: any) => ({
+          metric: r.metric, previous: r.previousValue, current: r.currentValue, delta: r.delta, severity: r.severity,
+        })),
+        criticalFindings: (reportData.criticalFindings || []).slice(0, 25).map((f: any) => ({
+          title: f.title, severity: f.severity, agent: f.agent, category: f.category,
+          evidence: f.evidence?.substring(0, 200),
+          remediation: f.remediation?.substring(0, 250),
+          cweId: f.cweId, cvssScore: f.cvssScore,
+        })),
+        recommendations: (reportData.recommendations || []).map((r: any) => ({
+          priority: r.priority, title: r.title, description: r.description,
+          impact: r.impact, effort: r.effort, category: r.category,
+        })),
+      };
+
+      // Add agent-specific metadata summaries
+      const agentResults = reportData.agentResults || [];
+      for (const agent of agentResults) {
+        if (agent.agentType === 'security' && agent.metadata) {
+          const m = agent.metadata;
+          deepContext.securityDetails = {
+            sslGrade: m.sslAnalysis?.grade,
+            sslIssues: m.sslAnalysis?.issues,
+            headerScore: m.headerAnalysis?.score,
+            missingHeaders: m.headerAnalysis?.missing,
+            corsIssues: m.corsAnalysis?.issues,
+            corsWildcard: m.corsAnalysis?.wildcardDetected,
+            tokenLeaks: (m.tokenLeaks || []).map((t: any) => ({ type: t.type, location: t.location, severity: t.severity })),
+            drmAnalysis: m.drmAnalysis,
+            owaspFindings: (m.owaspFindings || []).slice(0, 10).map((o: any) => ({
+              category: o.category, name: o.name, risk: o.risk, details: o.details?.substring(0, 100),
+            })),
+            dependencyVulns: (m.dependencyVulns || []).slice(0, 10).map((d: any) => ({
+              package: d.package, version: d.version, vulnerability: d.vulnerability,
+              severity: d.severity, cveId: d.cveId, fixVersion: d.fixVersion,
+            })),
+            apiExposure: (m.apiExposure || []).slice(0, 10).map((a: any) => ({
+              endpoint: a.endpoint, method: a.method, authenticated: a.authenticated, issues: a.issues,
+            })),
+          };
+        }
+        if (agent.agentType === 'performance' && agent.metadata) {
+          const m = agent.metadata;
+          deepContext.performanceDetails = {
+            lighthouse: m.lighthouse,
+            coreWebVitals: m.coreWebVitals,
+            playerMetrics: m.playerMetrics,
+            cdnMetrics: m.cdnMetrics ? {
+              hitRatio: m.cdnMetrics.hitRatio, avgLatency: m.cdnMetrics.avgLatency,
+              p95Latency: m.cdnMetrics.p95Latency, compression: m.cdnMetrics.compressionEnabled,
+            } : null,
+            resourceMetrics: m.resourceMetrics ? {
+              totalSize: m.resourceMetrics.totalSize, jsSize: m.resourceMetrics.jsSize,
+              cssSize: m.resourceMetrics.cssSize, imageSize: m.resourceMetrics.imageSize,
+              requestCount: m.resourceMetrics.requestCount,
+              renderBlockingCount: m.resourceMetrics.renderBlockingResources?.length,
+            } : null,
+          };
+        }
+        if (agent.agentType === 'code-quality' && agent.metadata) {
+          const m = agent.metadata;
+          deepContext.codeQualityDetails = {
+            lintResults: m.lintResults,
+            complexity: m.complexity,
+            deadCodeCount: m.deadCode?.length,
+            memoryLeaks: (m.memoryLeaks || []).slice(0, 5).map((l: any) => ({
+              type: l.type, file: l.file, description: l.description, severity: l.severity,
+            })),
+            asyncIssues: (m.asyncIssues || []).slice(0, 5).map((a: any) => ({
+              type: a.type, file: a.file, description: a.description,
+            })),
+            antiPatterns: (m.antiPatterns || []).slice(0, 5).map((p: any) => ({
+              pattern: p.pattern, file: p.file, suggestion: p.suggestion,
+            })),
+          };
+        }
+      }
+
+      messages.push({
+        role: 'system',
+        content: `Here is the complete scan report data. Use this as your primary knowledge base. Answer ONLY based on this data — do not fabricate findings.\n\n${JSON.stringify(deepContext)}`,
+      });
+    }
+
+    // Add conversation history for multi-turn context (last 10 messages)
+    if (Array.isArray(history)) {
+      for (const h of history.slice(-10)) {
+        if (h.role === 'user' || h.role === 'assistant') {
+          messages.push({ role: h.role, content: h.content?.substring(0, 500) });
+        }
+      }
+    }
+
+    messages.push({ role: 'user', content: message });
+
+    const completion = await openai.chat.completions.create({
+      model: process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini',
+      messages,
+      max_tokens: 2000,
+      temperature: 0.5,
+    });
+
+    const reply = completion.choices[0]?.message?.content || 'No response generated.';
+
+    res.json({ reply, mode });
+  } catch (error) {
+    logger.error('Chat endpoint error', { error: String(error) });
+    res.status(500).json({ error: 'Failed to process chat request' });
+  }
+});
+
+// ============================= REPORT GENERATION ENDPOINT =====================
+
+app.post('/api/reports/:scanId/generate', authMiddleware as any, requireRole('admin', 'devops', 'developer') as any, async (req: AuthRequest, res: Response) => {
+  const { scanId } = req.params;
+  const { mode } = req.body;
+
+  if (!mode || !['management', 'developer'].includes(mode)) {
+    return res.status(400).json({ error: 'mode must be "management" or "developer"' });
+  }
+
+  try {
+    // Load scan report from PostgreSQL
+    const result = await pg.query(
+      'SELECT report_json FROM scan_reports WHERE scan_id = $1',
+      [scanId],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    const reportData = result.rows[0].report_json;
+
+    // If OpenAI is not configured, return a structured fallback
+    if (!openai) {
+      const overallScore = reportData.kpiScore?.overallScore ?? reportData.overallScore ?? 'N/A';
+      const securityScore = reportData.kpiScore?.grades?.security?.rawScore ?? reportData.securityScore ?? 'N/A';
+      const performanceScore = reportData.kpiScore?.grades?.performance?.rawScore ?? reportData.performanceScore ?? 'N/A';
+      const codeQualityScore = reportData.kpiScore?.grades?.codeQuality?.rawScore ?? reportData.codeQualityScore ?? 'N/A';
+      const findings = reportData.criticalFindings || [];
+      const recommendations = reportData.recommendations || [];
+
+      const fallbackContent = mode === 'management'
+        ? `# Executive Summary\n\n` +
+          `**Overall Score:** ${overallScore}/100\n` +
+          `**Security Score:** ${securityScore}/100\n` +
+          `**Performance Score:** ${performanceScore}/100\n` +
+          `**Code Quality Score:** ${codeQualityScore}/100\n\n` +
+          `**Critical Findings:** ${findings.length}\n\n` +
+          `## Risk Assessment\n\n` +
+          (Number(securityScore) < 70 ? '- **HIGH RISK**: Security score below acceptable threshold. Immediate remediation recommended.\n' : '') +
+          (Number(performanceScore) < 70 ? '- **MEDIUM RISK**: Performance degradation detected. User experience may be impacted.\n' : '') +
+          (Number(codeQualityScore) < 70 ? '- **MEDIUM RISK**: Code quality issues may increase maintenance costs.\n' : '') +
+          `\n## Top Recommendations\n` +
+          recommendations.slice(0, 5).map((r: any, i: number) => `${i + 1}. ${r.title || r}`).join('\n') +
+          `\n\n## Critical Issues Requiring Attention\n` +
+          findings.slice(0, 5).map((f: any, i: number) => `${i + 1}. **[${(f.severity || 'info').toUpperCase()}]** ${f.title || f.description || f}`).join('\n') +
+          `\n\n*Note: AI-enhanced report generation requires an OpenAI API key. Configure OPENAI_API_KEY for detailed analysis.*`
+        : `# Developer Report\n\n` +
+          `**Overall Score:** ${overallScore}/100\n` +
+          `**Security Score:** ${securityScore}/100\n` +
+          `**Performance Score:** ${performanceScore}/100\n` +
+          `**Code Quality Score:** ${codeQualityScore}/100\n\n` +
+          `## Critical Findings (${findings.length} total)\n\n` +
+          findings.slice(0, 15).map((f: any, i: number) => {
+            const parts = [`${i + 1}. **[${(f.severity || 'info').toUpperCase()}]** ${f.title || f.description || f}`];
+            if (f.evidence) parts.push(`   - Evidence: \`${f.evidence}\``);
+            if (f.remediation) parts.push(`   - Fix: ${f.remediation}`);
+            if (f.agent) parts.push(`   - Agent: ${f.agent}`);
+            return parts.join('\n');
+          }).join('\n') +
+          `\n\n## Recommendations\n` +
+          recommendations.slice(0, 10).map((r: any, i: number) => {
+            const parts = [`${i + 1}. **${r.title || r}**`];
+            if (r.priority) parts.push(`   - Priority: ${r.priority}`);
+            if (r.impact) parts.push(`   - Impact: ${r.impact}`);
+            return parts.join('\n');
+          }).join('\n') +
+          `\n\n*Note: AI-enhanced report generation requires an OpenAI API key. Configure OPENAI_API_KEY for detailed analysis.*`;
+
+      return res.json({
+        content: fallbackContent,
+        mode,
+        scanId,
+        generatedAt: new Date().toISOString(),
+      });
+    }
+
+    // Build a condensed report summary to stay within token limits
+    const condensed = {
+      target: reportData.target,
+      platform: reportData.platform,
+      overallScore: reportData.kpiScore?.overallScore,
+      grades: {
+        security: reportData.kpiScore?.grades?.security,
+        performance: reportData.kpiScore?.grades?.performance,
+        codeQuality: reportData.kpiScore?.grades?.codeQuality,
+      },
+      executiveSummary: reportData.executiveSummary,
+      criticalFindings: (reportData.criticalFindings || []).slice(0, 20).map((f: any) => ({
+        title: f.title, severity: f.severity, agent: f.agent,
+        evidence: f.evidence?.substring(0, 150), remediation: f.remediation?.substring(0, 200),
+      })),
+      recommendations: (reportData.recommendations || []).slice(0, 10).map((r: any) => ({
+        title: r.title, priority: r.priority, impact: r.impact, agent: r.agent,
+      })),
+      regressions: reportData.kpiScore?.regressions,
+    };
+
+    // Build system prompt based on mode
+    const systemPrompt = mode === 'management'
+      ? 'Generate an executive management report for an OTT platform scan. Include: 1) Risk Posture Summary with RAG status, 2) Financial Exposure estimate, 3) Compliance Status (OWASP, PCI-DSS, SOC2), 4) Customer Impact Assessment, 5) Strategic Roadmap with 30/60/90 day timeline, 6) Executive Recommendations (max 5). Use clear business language, no code snippets.'
+      : 'Generate a detailed developer report for an OTT platform scan. Include: 1) Vulnerability Deep-Dive with CWE references, 2) Code Fix Patches (show before/after code), 3) Configuration Recommendations (nginx, CDN, headers), 4) Performance Optimization Guide, 5) Dependency Upgrade Path, 6) Architecture Recommendations. Be specific and technical.';
+
+    const completion = await openai.chat.completions.create({
+      model: process.env.OPENAI_REPORT_MODEL || 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: JSON.stringify(condensed) },
+      ],
+      max_tokens: 3000,
+      temperature: 0.3,
+    });
+
+    const content = completion.choices[0]?.message?.content || 'No report generated.';
+
+    res.json({
+      content,
+      mode,
+      scanId,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('Report generation error', { error: String(error), scanId });
+    res.status(500).json({ error: 'Failed to generate report' });
+  }
+});
+
+// ============================= COMPETITIVE COMPARISON ========================
+
+function extractComparisonData(report: any, url: string) {
+  const secMeta = report.agentResults?.find((r: any) => r.agentType === 'security')?.metadata || {};
+  const perfMeta = report.agentResults?.find((r: any) => r.agentType === 'performance')?.metadata || {};
+
+  return {
+    url,
+    scanId: report.scanId,
+    scannedAt: report.generatedAt,
+    overallScore: report.kpiScore?.overallScore || 0,
+    securityScore: report.kpiScore?.grades?.security?.rawScore || 0,
+    performanceScore: report.kpiScore?.grades?.performance?.rawScore || 0,
+    codeQualityScore: report.kpiScore?.grades?.codeQuality?.rawScore || 0,
+    sslGrade: secMeta.sslAnalysis?.grade || 'N/A',
+    headerScore: secMeta.headerAnalysis?.score || 0,
+    missingHeaders: secMeta.headerAnalysis?.missing || [],
+    corsIssues: secMeta.corsAnalysis?.issues || [],
+    tokenLeakCount: (secMeta.tokenLeaks || []).length,
+    dependencyVulnCount: (secMeta.dependencyVulns || []).length,
+    drmStatus: {
+      widevineDetected: secMeta.drmAnalysis?.widevineDetected || false,
+      fairplayDetected: secMeta.drmAnalysis?.fairplayDetected || false,
+      licenseUrlExposed: secMeta.drmAnalysis?.licenseUrlExposed || false,
+    },
+    owaspSummary: (secMeta.owaspFindings || []).reduce((acc: any[], f: any) => {
+      const existing = acc.find((a: any) => a.category === f.category);
+      if (existing) { existing.count++; } else { acc.push({ category: f.category, risk: f.risk, count: 1 }); }
+      return acc;
+    }, []),
+    lighthouseScores: {
+      performance: perfMeta.lighthouse?.performanceScore || 0,
+      accessibility: perfMeta.lighthouse?.accessibilityScore || 0,
+      bestPractices: perfMeta.lighthouse?.bestPracticesScore || 0,
+      seo: perfMeta.lighthouse?.seoScore || 0,
+    },
+    coreWebVitals: perfMeta.coreWebVitals || {},
+    criticalFindingsCount: (report.criticalFindings || []).filter((f: any) => f.severity === 'critical').length,
+    highFindingsCount: (report.criticalFindings || []).filter((f: any) => f.severity === 'high').length,
+    totalFindingsCount: report.agentResults?.reduce((sum: number, r: any) => sum + (r.findings?.length || 0), 0) || 0,
+  };
+}
+
+// List all previously scanned URLs for auto-populating competition analysis
+app.get('/api/compare/scanned-urls', authMiddleware as any, async (_req: AuthRequest, res: Response) => {
+  try {
+    const result = await pg.query(
+      `SELECT target_url, overall_score, created_at
+       FROM scan_reports
+       ORDER BY created_at DESC`,
+    );
+
+    // Deduplicate by URL, keeping the latest scan for each
+    const seen = new Map<string, { url: string; score: number; scannedAt: string }>();
+    for (const row of result.rows) {
+      if (!seen.has(row.target_url)) {
+        seen.set(row.target_url, {
+          url: row.target_url,
+          score: row.overall_score ?? 0,
+          scannedAt: row.created_at,
+        });
+      }
+    }
+
+    res.json({ urls: Array.from(seen.values()) });
+  } catch (error) {
+    logger.error('Failed to list scanned URLs', { error: String(error) });
+    res.status(500).json({ error: 'Failed to list scanned URLs' });
+  }
+});
+
+// Delete all scan reports for a specific URL
+app.delete('/api/compare/scanned-urls', authMiddleware as any, requireRole('admin', 'devops') as any, async (req: AuthRequest, res: Response) => {
+  const { url } = req.body;
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url is required' });
+  }
+  try {
+    const result = await pg.query('DELETE FROM scan_reports WHERE target_url = $1', [url]);
+    logger.info(`Deleted ${result.rowCount} scan reports for ${url}`);
+    res.json({ deleted: result.rowCount, url });
+  } catch (error) {
+    logger.error('Failed to delete scanned URL', { error: String(error) });
+    res.status(500).json({ error: 'Failed to delete scanned URL' });
+  }
+});
+
+app.post('/api/compare', authMiddleware as any, async (req: AuthRequest, res: Response) => {
+  const { primaryUrl, competitorUrls } = req.body;
+
+  if (!primaryUrl || typeof primaryUrl !== 'string') {
+    return res.status(400).json({ error: 'primaryUrl is required and must be a string' });
+  }
+  if (!competitorUrls || !Array.isArray(competitorUrls) || competitorUrls.length < 1 || competitorUrls.length > 19) {
+    return res.status(400).json({ error: 'competitorUrls must be an array with 1-19 items' });
+  }
+
+  try {
+    const allUrls = [primaryUrl, ...competitorUrls];
+    const SCAN_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+
+    // For each URL, fetch latest report from DB or trigger a fresh scan
+    const reportPromises = allUrls.map(async (url: string) => {
+      const dbResult = await pg.query(
+        'SELECT report_json, target_url, overall_score, created_at FROM scan_reports WHERE target_url = $1 ORDER BY created_at DESC LIMIT 1',
+        [url],
+      );
+
+      if (dbResult.rows.length > 0) {
+        return dbResult.rows[0].report_json;
+      }
+
+      // No existing report — trigger a fresh scan with timeout
+      const config = Orchestrator.createConfig({
+        url,
+        agents: ['security', 'performance', 'code-quality'],
+        platform: 'both',
+        thresholds: systemConfig.thresholds,
+      });
+      const orchestrator = new Orchestrator();
+      const report = await Promise.race([
+        orchestrator.runScan(config),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`Scan timeout after 5 minutes for ${url}`)), SCAN_TIMEOUT),
+        ),
+      ]);
+      return report;
+    });
+
+    const settled = await Promise.allSettled(reportPromises);
+
+    // Extract comparison data from successful results
+    const comparisonResults: any[] = [];
+    for (let i = 0; i < settled.length; i++) {
+      const result = settled[i];
+      if (result.status === 'fulfilled' && result.value) {
+        comparisonResults.push(extractComparisonData(result.value, allUrls[i]));
+      } else {
+        const errMsg = result.status === 'rejected' ? (result.reason?.message || String(result.reason)) : 'No data returned';
+        logger.warn(`Compare: scan failed for ${allUrls[i]}`, { error: errMsg });
+        // Return a complete ComparisonSiteData object with zeroed values for failed scans
+        comparisonResults.push({
+          url: allUrls[i],
+          scanId: 'failed',
+          scannedAt: new Date().toISOString(),
+          overallScore: 0,
+          securityScore: 0,
+          performanceScore: 0,
+          codeQualityScore: 0,
+          sslGrade: 'N/A',
+          headerScore: 0,
+          missingHeaders: [],
+          corsIssues: [],
+          tokenLeakCount: 0,
+          dependencyVulnCount: 0,
+          drmStatus: { widevineDetected: false, fairplayDetected: false, licenseUrlExposed: false },
+          owaspSummary: [],
+          lighthouseScores: { performance: 0, accessibility: 0, bestPractices: 0, seo: 0 },
+          coreWebVitals: {},
+          criticalFindingsCount: 0,
+          highFindingsCount: 0,
+          totalFindingsCount: 0,
+          error: errMsg,
+        });
+      }
+    }
+
+    const primaryData = comparisonResults[0];
+    const competitorData = comparisonResults.slice(1);
+
+    // AI comparison analysis
+    let aiAnalysis: any = {};
+
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (openaiKey) {
+      try {
+        const OpenAIDynamic = (await import('openai')).default;
+        const openaiClient = new OpenAIDynamic({ apiKey: openaiKey });
+
+        const condensed = {
+          primary: { url: primaryData.url, overall: primaryData.overallScore, security: primaryData.securityScore, performance: primaryData.performanceScore, codeQuality: primaryData.codeQualityScore, ssl: primaryData.sslGrade, headers: primaryData.headerScore, findings: primaryData.totalFindingsCount, critical: primaryData.criticalFindingsCount },
+          competitors: competitorData.map((c: any) => ({ url: c.url, overall: c.overallScore, security: c.securityScore, performance: c.performanceScore, codeQuality: c.codeQualityScore, ssl: c.sslGrade, headers: c.headerScore, findings: c.totalFindingsCount, critical: c.criticalFindingsCount })),
+        };
+
+        const response = await openaiClient.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: `You are an OTT platform security and performance analyst. Analyze the competitive comparison data and provide a structured JSON response. Return ONLY valid JSON with these fields:
+{
+  "competitiveGapScore": number (0-100, how far the primary site is from leader in each area),
+  "verdict": string (2-3 sentence "Who is Leading?" verdict),
+  "leader": string (URL of the overall technical leader),
+  "primaryStrengths": string[] (3-5 strengths of primary site),
+  "primaryWeaknesses": string[] (3-5 weaknesses of primary site),
+  "competitorInsights": [{ "url": string, "strengths": string[], "weaknesses": string[] }],
+  "improvementRoadmap": [
+    { "timeframe": "30-day", "actions": string[] },
+    { "timeframe": "60-day", "actions": string[] },
+    { "timeframe": "90-day", "actions": string[] }
+  ],
+  "strategicSuggestions": string[] (5-7 strategic recommendations),
+  "successMatrix": [{ "metric": string, "primary": number, "competitors": [{ "url": string, "value": number }], "leader": string, "gap": number }],
+  "riskRating": "low"|"medium"|"high"|"critical",
+  "businessImpactScore": number (0-100)
+}` },
+            { role: 'user', content: `Compare these OTT platforms:\n${JSON.stringify(condensed, null, 2)}` },
+          ],
+          temperature: 0.3,
+          max_tokens: 3000,
+        });
+
+        const content = response.choices[0]?.message?.content || '{}';
+        aiAnalysis = JSON.parse(content.replace(/```json\n?|\n?```/g, ''));
+      } catch (e) {
+        logger.warn('Failed to parse AI comparison analysis, using fallback');
+      }
+    }
+
+    // Fallback if AI analysis is empty (no OpenAI key or parsing failed)
+    if (!aiAnalysis.verdict) {
+      const allSites = [primaryData, ...competitorData].filter((s: any) => !s.error);
+      const leader = allSites.length > 0
+        ? allSites.reduce((best: any, s: any) => s.overallScore > best.overallScore ? s : best, allSites[0])
+        : primaryData;
+      const gap = leader.overallScore - primaryData.overallScore;
+
+      aiAnalysis = {
+        competitiveGapScore: Math.max(0, Math.min(100, Math.round(gap * 2))),
+        verdict: `${leader.url} leads with a score of ${leader.overallScore.toFixed(1)}. ${primaryData.url} scores ${primaryData.overallScore.toFixed(1)}, trailing by ${gap.toFixed(1)} points.`,
+        leader: leader.url,
+        primaryStrengths: [primaryData.securityScore >= 80 ? 'Strong security posture' : '', primaryData.performanceScore >= 80 ? 'Good performance metrics' : '', primaryData.codeQualityScore >= 80 ? 'High code quality' : ''].filter(Boolean),
+        primaryWeaknesses: [primaryData.securityScore < 70 ? 'Security needs improvement' : '', primaryData.performanceScore < 70 ? 'Performance optimization required' : '', primaryData.codeQualityScore < 70 ? 'Code quality issues detected' : ''].filter(Boolean),
+        competitorInsights: competitorData.map((c: any) => ({
+          url: c.url,
+          strengths: [c.securityScore >= 80 ? 'Strong security' : '', c.performanceScore >= 80 ? 'Good performance' : ''].filter(Boolean),
+          weaknesses: [c.securityScore < 70 ? 'Security gaps' : '', c.performanceScore < 70 ? 'Performance issues' : ''].filter(Boolean),
+        })),
+        improvementRoadmap: [
+          { timeframe: '30-day', actions: ['Fix critical security vulnerabilities', 'Optimize Core Web Vitals'] },
+          { timeframe: '60-day', actions: ['Implement missing security headers', 'Reduce JavaScript bundle size'] },
+          { timeframe: '90-day', actions: ['Achieve target KPI score of 95', 'Full OWASP compliance'] },
+        ],
+        strategicSuggestions: ['Focus on security hardening to close the gap', 'Optimize CDN configuration for better performance', 'Address DRM protection issues', 'Reduce dependency vulnerabilities', 'Improve Core Web Vitals metrics'],
+        successMatrix: [
+          { metric: 'Overall Score', primary: primaryData.overallScore, competitors: competitorData.map((c: any) => ({ url: c.url, value: c.overallScore })), leader: leader.url, gap },
+          { metric: 'Security', primary: primaryData.securityScore, competitors: competitorData.map((c: any) => ({ url: c.url, value: c.securityScore })), leader: allSites.reduce((b: any, s: any) => s.securityScore > b.securityScore ? s : b, allSites[0]).url, gap: Math.max(...allSites.map((s: any) => s.securityScore)) - primaryData.securityScore },
+          { metric: 'Performance', primary: primaryData.performanceScore, competitors: competitorData.map((c: any) => ({ url: c.url, value: c.performanceScore })), leader: allSites.reduce((b: any, s: any) => s.performanceScore > b.performanceScore ? s : b, allSites[0]).url, gap: Math.max(...allSites.map((s: any) => s.performanceScore)) - primaryData.performanceScore },
+          { metric: 'Code Quality', primary: primaryData.codeQualityScore, competitors: competitorData.map((c: any) => ({ url: c.url, value: c.codeQualityScore })), leader: allSites.reduce((b: any, s: any) => s.codeQualityScore > b.codeQualityScore ? s : b, allSites[0]).url, gap: Math.max(...allSites.map((s: any) => s.codeQualityScore)) - primaryData.codeQualityScore },
+        ],
+        riskRating: primaryData.overallScore >= 90 ? 'low' : primaryData.overallScore >= 70 ? 'medium' : primaryData.overallScore >= 50 ? 'high' : 'critical',
+        businessImpactScore: Math.round(100 - gap),
+      };
+    }
+
+    res.json({
+      primary: primaryData,
+      competitors: competitorData,
+      aiAnalysis,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('Compare endpoint error', { error: String(error) });
+    res.status(500).json({ error: 'Failed to process comparison' });
+  }
+});
+
+// Health check (public)
+app.get('/api/health', (_req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
 });
 
 // ============================= WEBSOCKET ===================================
@@ -770,43 +1323,15 @@ io.on('connection', (socket) => {
 });
 
 // ============================= START SERVER =================================
-const PORT = parseInt(process.env.PORT || process.env.DASHBOARD_PORT || '3001');
-const HOST = process.env.HOST || '0.0.0.0';  // Bind to all interfaces (required for Render/Docker)
-
-// Catch unhandled errors so the server doesn't crash silently
-process.on('unhandledRejection', (reason) => {
-  logger.error('Unhandled rejection', { error: String(reason) });
-});
-process.on('uncaughtException', (err) => {
-  logger.error('Uncaught exception', { error: String(err), stack: err.stack });
-  // Don't exit — let health check keep responding
-});
+const PORT = parseInt(process.env.DASHBOARD_PORT || '3000');
 
 async function start() {
-  // Start listening FIRST so health check responds immediately
-  server.listen(PORT, HOST, () => {
-    logger.info(`Dashboard API running on http://${HOST}:${PORT}`);
+  await initializeAuthDB();
+  await loadSystemConfig();
+  server.listen(PORT, () => {
+    logger.info(`Dashboard API running on http://localhost:${PORT}`);
     logger.info(`Default admin credentials: admin@dishtv.in / admin123`);
   });
-
-  // Initialize database in background (don't block server startup)
-  try {
-    const dbTimeout = new Promise<void>((_, reject) =>
-      setTimeout(() => reject(new Error('DB init timeout after 10s')), 10000),
-    );
-    await Promise.race([initializeAuthDB(), dbTimeout]);
-  } catch (err) {
-    logger.error('DB init failed (will retry on first request)', { error: String(err) });
-  }
-
-  try {
-    const configTimeout = new Promise<void>((_, reject) =>
-      setTimeout(() => reject(new Error('Config load timeout')), 5000),
-    );
-    await Promise.race([loadSystemConfig(), configTimeout]);
-  } catch (err) {
-    logger.error('Config load failed (using defaults)', { error: String(err) });
-  }
 }
 
 start().catch((err) => {

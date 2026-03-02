@@ -6,7 +6,7 @@ import OpenAI from 'openai';
 import { Logger } from '../../utils/logger';
 import {
   AgentResult, ScanConfig, ScanReport, KPIScore,
-  WeightedScore, Finding, Recommendation, Regression,
+  WeightedScore, Finding, Recommendation, EnhancedRecommendation, Regression,
   Severity, TrendData, ScanComparison,
 } from '../../types';
 
@@ -21,7 +21,7 @@ import {
 //   info     = -0  points
 //
 // Clamp: [0, 100]
-// Target: ≥95 overall
+// Target: configurable via system thresholds (default ≥95)
 
 const AGENT_WEIGHTS = {
   security: 0.40,
@@ -64,10 +64,13 @@ export class ReportGenerator {
       .sort((a, b) => this.severityRank(a.severity) - this.severityRank(b.severity));
 
     // 4. Generate AI-powered executive summary
-    const executiveSummary = await this.generateExecutiveSummary(kpiScore, criticalFindings, comparison);
+    const executiveSummary = await this.generateExecutiveSummary(kpiScore, criticalFindings, comparison, config.thresholds.overall);
 
     // 5. Generate prioritized recommendations
     const recommendations = await this.generateRecommendations(agentResults, kpiScore);
+
+    // 6. Generate enhanced AI recommendations with projected scores
+    const enhancedRecommendations = this.generateEnhancedRecommendations(agentResults, kpiScore, recommendations);
 
     const report: ScanReport = {
       id: `report_${Date.now()}`,
@@ -80,6 +83,7 @@ export class ReportGenerator {
       executiveSummary,
       criticalFindings,
       recommendations,
+      enhancedRecommendations,
       comparisonWithPrevious: comparison,
     };
 
@@ -224,15 +228,16 @@ export class ReportGenerator {
     kpiScore: KPIScore,
     criticalFindings: Finding[],
     comparison?: ScanComparison,
+    thresholdOverall: number = 95,
   ): Promise<string> {
     if (!this.openai) {
-      return this.generateStaticSummary(kpiScore, criticalFindings, comparison);
+      return this.generateStaticSummary(kpiScore, criticalFindings, comparison, thresholdOverall);
     }
 
     try {
       const prompt = `You are an OTT platform security and performance analyst. Generate a concise executive summary (max 300 words) for this scan report:
 
-OVERALL SCORE: ${kpiScore.overallScore}/100 (target: 95)
+OVERALL SCORE: ${kpiScore.overallScore}/100 (target: ${thresholdOverall})
 PASSES THRESHOLD: ${kpiScore.passesThreshold}
 
 SECURITY SCORE: ${kpiScore.grades.security.rawScore}/100
@@ -260,10 +265,10 @@ Focus on: 1) Overall health assessment 2) Most critical risks 3) OTT-specific co
         temperature: 0.3,
       });
 
-      return response.choices[0]?.message?.content || this.generateStaticSummary(kpiScore, criticalFindings, comparison);
+      return response.choices[0]?.message?.content || this.generateStaticSummary(kpiScore, criticalFindings, comparison, thresholdOverall);
     } catch (error) {
       this.logger.warn('AI summary generation failed, using static summary', { error: String(error) });
-      return this.generateStaticSummary(kpiScore, criticalFindings, comparison);
+      return this.generateStaticSummary(kpiScore, criticalFindings, comparison, thresholdOverall);
     }
   }
 
@@ -271,12 +276,13 @@ Focus on: 1) Overall health assessment 2) Most critical risks 3) OTT-specific co
     kpiScore: KPIScore,
     criticalFindings: Finding[],
     comparison?: ScanComparison,
+    thresholdOverall: number = 95,
   ): string {
     const status = kpiScore.passesThreshold ? 'PASSES' : 'FAILS';
     const trendEmoji = kpiScore.trend.direction === 'improving' ? 'Improving' :
       kpiScore.trend.direction === 'declining' ? 'Declining' : 'Stable';
 
-    let summary = `Overall KPI Score: ${kpiScore.overallScore}/100 - ${status} threshold (95). `;
+    let summary = `Overall KPI Score: ${kpiScore.overallScore}/100 - ${status} threshold (${thresholdOverall}). `;
     summary += `Trend: ${trendEmoji} (${kpiScore.trend.delta > 0 ? '+' : ''}${kpiScore.trend.delta.toFixed(1)}). `;
     summary += `Security: ${kpiScore.grades.security.rawScore}/100, Performance: ${kpiScore.grades.performance.rawScore}/100, Code Quality: ${kpiScore.grades.codeQuality.rawScore}/100. `;
 
@@ -340,6 +346,71 @@ Focus on: 1) Overall health assessment 2) Most critical risks 3) OTT-specific co
     }
 
     return recommendations;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Enhanced AI Recommendations with Projected Scores
+  // ---------------------------------------------------------------------------
+  private generateEnhancedRecommendations(
+    agentResults: AgentResult[],
+    kpiScore: KPIScore,
+    baseRecommendations: Recommendation[],
+  ): EnhancedRecommendation[] {
+    const allFindings = agentResults.flatMap((r) => r.findings);
+    const enhanced: EnhancedRecommendation[] = [];
+
+    // Group findings by category for score impact calculation
+    const categoryGroups = new Map<string, Finding[]>();
+    for (const finding of allFindings) {
+      const group = categoryGroups.get(finding.category) || [];
+      group.push(finding);
+      categoryGroups.set(finding.category, group);
+    }
+
+    for (const rec of baseRecommendations.slice(0, 10)) {
+      const categoryFindings = categoryGroups.get(rec.title.replace(/Address (.+) issues.*/, '$1')) || [];
+      const totalPenalty = categoryFindings.reduce((s, f) => s + this.severityPoints(f.severity), 0);
+
+      // Calculate impact/risk/ease scores
+      const maxSeverity = categoryFindings.length > 0
+        ? Math.min(...categoryFindings.map((f) => this.severityRank(f.severity)))
+        : 5;
+      const impactScore = Math.min(10, Math.round((totalPenalty / 25) * 10));
+      const riskScore = Math.round(((5 - maxSeverity + 1) / 5) * 10);
+      const easeScore = rec.effort === 'low' ? 8 : rec.effort === 'medium' ? 5 : 3;
+
+      // Calculate projected score gain per agent
+      const weight = AGENT_WEIGHTS[rec.category as keyof typeof AGENT_WEIGHTS] || 0;
+      const projectedScoreGain = Math.round(totalPenalty * weight * 100) / 100;
+
+      // Determine affected metric
+      const affectedMetric = rec.category === 'security' ? 'Security Score'
+        : rec.category === 'performance' ? 'Performance Score'
+        : 'Code Quality Score';
+
+      enhanced.push({
+        ...rec,
+        impactScore: Math.max(1, impactScore),
+        riskScore: Math.max(1, riskScore),
+        easeScore: Math.max(1, easeScore),
+        projectedScoreGain: Math.max(0.5, projectedScoreGain),
+        confidence: categoryFindings.length > 0 ? 0.85 : 0.6,
+        quickWin: easeScore >= 7 && impactScore >= 5,
+        affectedMetric,
+      });
+    }
+
+    // Sort by composite priority: risk * impact / effort
+    enhanced.sort((a, b) => {
+      const aScore = (a.riskScore * a.impactScore) / (11 - a.easeScore);
+      const bScore = (b.riskScore * b.impactScore) / (11 - b.easeScore);
+      return bScore - aScore;
+    });
+
+    // Re-assign priorities
+    enhanced.forEach((r, i) => { r.priority = i + 1; });
+
+    return enhanced;
   }
 
   // ---------------------------------------------------------------------------

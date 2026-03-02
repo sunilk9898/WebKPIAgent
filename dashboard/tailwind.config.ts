@@ -49,6 +49,7 @@ const config: Config = {
         "fade-up": "fadeUp 0.5s ease-out forwards",
         "slide-in": "slideIn 0.3s ease-out forwards",
         "slide-in-right": "slideInRight 0.25s ease-out forwards",
+        "progress-bar": "progressBar 2s ease-in-out infinite",
       },
       keyframes: {
         scoreIn: {
@@ -66,6 +67,11 @@ const config: Config = {
         slideInRight: {
           "0%": { opacity: "0", transform: "translateX(100%)" },
           "100%": { opacity: "1", transform: "translateX(0)" },
+        },
+        progressBar: {
+          "0%": { width: "0%", marginLeft: "0%" },
+          "50%": { width: "60%", marginLeft: "20%" },
+          "100%": { width: "0%", marginLeft: "100%" },
         },
       },
     },

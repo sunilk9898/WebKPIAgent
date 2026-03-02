@@ -1,8 +1,8 @@
 // ============================================================================
-// API Client - Consumes backend REST endpoints
+// API Client - Consumes existing backend REST endpoints
 // ============================================================================
 
-import type { ScanReport, AgentType, Platform } from "@/types/api";
+import type { ScanReport, AgentType, Platform, ComparisonResult } from "@/types/api";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL || "/api";
 
@@ -228,6 +228,57 @@ export async function deleteUser(id: string): Promise<{ message: string }> {
 }
 
 // ---------------------------------------------------------------------------
+// Chat (AI Assistant)
+// ---------------------------------------------------------------------------
+export interface ChatResponse {
+  reply: string;
+}
+
+export interface ChatReportListItem {
+  scanId: string;
+  target: string;
+  score: number | null;
+  platform: string | null;
+  createdAt: string;
+}
+
+export async function getChatReports(): Promise<{ reports: ChatReportListItem[] }> {
+  return request<{ reports: ChatReportListItem[] }>("/chat/reports");
+}
+
+export async function sendChatMessage(
+  message: string,
+  mode: "developer" | "management",
+  scanId?: string,
+  history?: { role: string; content: string }[],
+): Promise<ChatResponse> {
+  return request<ChatResponse>("/chat", {
+    method: "POST",
+    body: JSON.stringify({ message, mode, scanId, history }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Report Generation (AI Modes)
+// ---------------------------------------------------------------------------
+export interface GeneratedReport {
+  content: string;
+  mode: string;
+  scanId: string;
+  generatedAt: string;
+}
+
+export async function generateReport(
+  scanId: string,
+  mode: "management" | "developer",
+): Promise<GeneratedReport> {
+  return request<GeneratedReport>(`/reports/${scanId}/generate`, {
+    method: "POST",
+    body: JSON.stringify({ mode }),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
 export async function getHealth(): Promise<{
@@ -245,5 +296,35 @@ export async function createJiraTicket(findingId: string): Promise<{ ticketId: s
   return request("/jira/create", {
     method: "POST",
     body: JSON.stringify({ findingId }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Competition Analysis
+// ---------------------------------------------------------------------------
+export interface ScannedUrlEntry {
+  url: string;
+  score: number;
+  scannedAt: string;
+}
+
+export async function getScannedUrls(): Promise<{ urls: ScannedUrlEntry[] }> {
+  return request<{ urls: ScannedUrlEntry[] }>("/compare/scanned-urls");
+}
+
+export async function deleteScannedUrl(url: string): Promise<{ deleted: number; url: string }> {
+  return request<{ deleted: number; url: string }>("/compare/scanned-urls", {
+    method: "DELETE",
+    body: JSON.stringify({ url }),
+  });
+}
+
+export async function compareUrls(
+  primaryUrl: string,
+  competitorUrls: string[],
+): Promise<ComparisonResult> {
+  return request<ComparisonResult>("/compare", {
+    method: "POST",
+    body: JSON.stringify({ primaryUrl, competitorUrls }),
   });
 }

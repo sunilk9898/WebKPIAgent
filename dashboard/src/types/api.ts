@@ -108,6 +108,7 @@ export interface ScanReport {
   executiveSummary: string;
   criticalFindings: Finding[];
   recommendations: Recommendation[];
+  enhancedRecommendations?: EnhancedRecommendation[];
   comparisonWithPrevious?: ScanComparison;
 }
 
@@ -118,6 +119,18 @@ export interface Recommendation {
   impact: string;
   effort: "low" | "medium" | "high";
   category: AgentType;
+}
+
+export interface EnhancedRecommendation extends Recommendation {
+  impactScore: number;
+  riskScore: number;
+  easeScore: number;
+  projectedScoreGain: number;
+  confidence: number;
+  quickWin: boolean;
+  affectedMetric: string;
+  currentValue?: string;
+  targetValue?: string;
 }
 
 export interface ScanComparison {
@@ -192,4 +205,67 @@ export interface WSScanComplete {
 export interface WSScanError {
   scanId: string;
   error: string;
+}
+
+// -- Competition Analysis --
+export interface ComparisonSiteData {
+  url: string;
+  scanId: string;
+  scannedAt: string;
+  overallScore: number;
+  securityScore: number;
+  performanceScore: number;
+  codeQualityScore: number;
+  sslGrade: string;
+  headerScore: number;
+  missingHeaders: string[];
+  corsIssues: string[];
+  tokenLeakCount: number;
+  dependencyVulnCount: number;
+  drmStatus: {
+    widevineDetected: boolean;
+    fairplayDetected: boolean;
+    licenseUrlExposed: boolean;
+  };
+  owaspSummary: { category: string; risk: Severity; count: number }[];
+  lighthouseScores: {
+    performance: number;
+    accessibility: number;
+    bestPractices: number;
+    seo: number;
+  };
+  coreWebVitals: Record<string, { value: number; rating: string }>;
+  criticalFindingsCount: number;
+  highFindingsCount: number;
+  totalFindingsCount: number;
+}
+
+export interface AIComparisonAnalysis {
+  competitiveGapScore: number;
+  verdict: string;
+  leader: string;
+  primaryStrengths: string[];
+  primaryWeaknesses: string[];
+  competitorInsights: { url: string; strengths: string[]; weaknesses: string[] }[];
+  improvementRoadmap: {
+    timeframe: "30-day" | "60-day" | "90-day";
+    actions: string[];
+  }[];
+  strategicSuggestions: string[];
+  successMatrix: {
+    metric: string;
+    primary: number;
+    competitors: { url: string; value: number }[];
+    leader: string;
+    gap: number;
+  }[];
+  riskRating: "low" | "medium" | "high" | "critical";
+  businessImpactScore: number;
+}
+
+export interface ComparisonResult {
+  primary: ComparisonSiteData;
+  competitors: ComparisonSiteData[];
+  aiAnalysis: AIComparisonAnalysis;
+  generatedAt: string;
 }

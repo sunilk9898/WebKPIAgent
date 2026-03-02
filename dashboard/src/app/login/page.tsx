@@ -1,21 +1,33 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { Zap, Loader2, AlertCircle } from "lucide-react";
 import { login } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
 import type { UserRole } from "@/types/api";
 
-// basePath for navigation — set at build time by next.config.js
-const basePath = process.env.NEXT_PUBLIC_BASE_PATH || "";
-
 export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const { setAuth } = useAuthStore();
+  const { setAuth, token, logout } = useAuthStore();
+  const router = useRouter();
+
+  // Sync cookie vs Zustand state to prevent redirect loops.
+  // Cookie expires after 24h but Zustand persists forever in localStorage.
+  // If cookie is gone but Zustand still has a token → clear stale state.
+  useEffect(() => {
+    const hasCookie = document.cookie.includes("vzy_token");
+    if (token && !hasCookie) {
+      logout();
+      return;
+    }
+    if (token && hasCookie) {
+      router.replace("/");
+    }
+  }, [token, router, logout]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -28,11 +40,11 @@ export default function LoginPage() {
         { id: user.id, email: user.email, name: user.name, role: user.role as UserRole },
         token,
       );
-      // Full page reload to ensure clean state — basePath is added automatically
-      window.location.href = (basePath || "") + "/";
+      // Full page reload so Next.js middleware picks up the new cookie
+      window.location.href = "/";
       return;
     } catch (err: any) {
-      setError(err.message || "Authentication failed. Check your credentials.");
+      setError(err.message || "Authentication failed");
     }
     setLoading(false);
   };
@@ -46,9 +58,7 @@ export default function LoginPage() {
             <Zap className="w-6 h-6 text-white" />
           </div>
           <h1 className="text-xl font-bold text-white">VZY Agent Dashboard</h1>
-          <p className="text-sm text-gray-500 mt-1">
-            OTT Website Security, Performance & Code Quality
-          </p>
+          <p className="text-sm text-gray-500 mt-1">Sign in to access OTT monitoring</p>
         </div>
 
         {/* Form */}
@@ -67,7 +77,7 @@ export default function LoginPage() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               className="input"
-              placeholder="admin@dishtv.in"
+              placeholder="you@dishtv.in"
               required
             />
           </div>
@@ -90,6 +100,9 @@ export default function LoginPage() {
           </button>
         </form>
 
+        <p className="text-center text-xs text-gray-600">
+          RBAC Roles: Admin, DevOps, Developer, Executive (view-only)
+        </p>
       </div>
     </div>
   );

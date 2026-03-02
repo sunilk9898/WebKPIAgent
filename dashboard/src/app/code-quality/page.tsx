@@ -6,20 +6,29 @@ import {
   BarChart3, AlertTriangle,
 } from "lucide-react";
 import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
-  Treemap,
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from "recharts";
 import { KPIGauge } from "@/components/charts/kpi-gauge";
 import { MetricCard } from "@/components/cards/metric-card";
 import { FindingRow } from "@/components/cards/finding-row";
 import { JsonViewer } from "@/components/shared/json-viewer";
+import { DetailDrawer } from "@/components/shared/detail-drawer";
+import { LintDetail } from "@/components/details/lint-detail";
+import { DeadCodeDetail } from "@/components/details/dead-code-detail";
+import { MemoryLeakDetail } from "@/components/details/memory-leak-detail";
+import { AsyncDetail } from "@/components/details/async-detail";
+import { ComplexityDetail } from "@/components/details/complexity-detail";
+import { AntiPatternDetail } from "@/components/details/anti-pattern-detail";
 import { useScanReport } from "@/hooks/use-scan-report";
 import { cn, getSeverityBg } from "@/lib/utils";
 import type { CodeQualityMetadata, Finding } from "@/types/api";
 
+type DetailKey = string | null;
+
 export default function CodeQualityPage() {
   const { report, codeQualityResult } = useScanReport();
   const [activeTab, setActiveTab] = useState<"overview" | "complexity" | "leaks" | "files" | "raw">("overview");
+  const [activeDetail, setActiveDetail] = useState<DetailKey>(null);
 
   if (!report || !codeQualityResult) {
     return (
@@ -43,7 +52,6 @@ export default function CodeQualityPage() {
     { id: "raw" as const, label: "Raw JSON" },
   ];
 
-  // Group findings by category for the overview
   const categoryGroups = useMemo(() => {
     const groups: Record<string, Finding[]> = {};
     for (const f of findings) {
@@ -54,7 +62,6 @@ export default function CodeQualityPage() {
     return Object.entries(groups).sort((a, b) => b[1].length - a[1].length);
   }, [findings]);
 
-  // Top problematic files
   const fileHeatmap = useMemo(() => {
     const fileCounts: Record<string, { total: number; critical: number; high: number }> = {};
     for (const f of findings) {
@@ -75,6 +82,27 @@ export default function CodeQualityPage() {
         high: counts.high,
       }));
   }, [findings]);
+
+  const getDrawerInfo = () => {
+    if (!activeDetail) return { title: "", subtitle: "" };
+    const map: Record<string, { title: string; subtitle: string }> = {
+      "lint:errors": { title: "Lint Errors", subtitle: "Critical code rule violations" },
+      "lint:warnings": { title: "Lint Warnings", subtitle: "Code style and potential issues" },
+      "lint:fixable": { title: "Auto-Fixable Issues", subtitle: "Issues that can be automatically resolved" },
+      "dead-code": { title: "Dead Code Analysis", subtitle: "Unused and unreachable code" },
+      "memory-leaks": { title: "Memory Leak Detection", subtitle: "Potential memory leak patterns" },
+      "tech-debt": { title: "Technical Debt", subtitle: "Accumulated maintenance burden" },
+      "anti-patterns": { title: "Anti-Patterns", subtitle: "Code patterns that should be refactored" },
+      "async-issues": { title: "Async Issues", subtitle: "Asynchronous code problems" },
+      "complexity:avg": { title: "Average Complexity", subtitle: "Cyclomatic complexity analysis" },
+      "complexity:max": { title: "Maximum Complexity", subtitle: "Most complex functions" },
+      "complexity:full": { title: "Code Complexity", subtitle: "Full complexity analysis" },
+      "complexity:duplicate": { title: "Duplicate Code", subtitle: "Code duplication analysis" },
+    };
+    return map[activeDetail] || { title: activeDetail, subtitle: "" };
+  };
+
+  const drawerInfo = getDrawerInfo();
 
   return (
     <div className="space-y-6 max-w-[1440px] mx-auto">
@@ -103,27 +131,22 @@ export default function CodeQualityPage() {
       {/* ── OVERVIEW TAB ── */}
       {activeTab === "overview" && (
         <div className="space-y-6">
-          {/* Summary Cards */}
+          {/* Summary Cards — ALL CLICKABLE */}
           <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
-            <MetricCard label="Lint Errors" value={meta?.lintResults?.errors || 0} icon={Bug} status={(meta?.lintResults?.errors || 0) > 0 ? "bad" : "good"} />
-            <MetricCard label="Lint Warnings" value={meta?.lintResults?.warnings || 0} icon={AlertTriangle} status={(meta?.lintResults?.warnings || 0) > 20 ? "warn" : "good"} />
-            <MetricCard label="Auto-fixable" value={meta?.lintResults?.fixable || 0} icon={Code2} status="neutral" />
-            <MetricCard label="Dead Code" value={meta?.deadCode?.length || 0} icon={Trash2} status={(meta?.deadCode?.length || 0) > 10 ? "warn" : "good"} />
-            <MetricCard label="Memory Leaks" value={meta?.memoryLeaks?.length || 0} icon={Timer} status={(meta?.memoryLeaks?.length || 0) > 0 ? "bad" : "good"} />
-            <MetricCard
-              label="Tech Debt"
-              value={meta?.complexity?.technicalDebt || "0d"}
-              icon={Brain}
-              status="neutral"
-            />
+            <MetricCard label="Lint Errors" value={meta?.lintResults?.errors || 0} icon={Bug} status={(meta?.lintResults?.errors || 0) > 0 ? "bad" : "good"} onClick={() => setActiveDetail("lint:errors")} />
+            <MetricCard label="Lint Warnings" value={meta?.lintResults?.warnings || 0} icon={AlertTriangle} status={(meta?.lintResults?.warnings || 0) > 20 ? "warn" : "good"} onClick={() => setActiveDetail("lint:warnings")} />
+            <MetricCard label="Auto-fixable" value={meta?.lintResults?.fixable || 0} icon={Code2} status="neutral" onClick={() => setActiveDetail("lint:fixable")} />
+            <MetricCard label="Dead Code" value={meta?.deadCode?.length || 0} icon={Trash2} status={(meta?.deadCode?.length || 0) > 10 ? "warn" : "good"} onClick={() => setActiveDetail("dead-code")} />
+            <MetricCard label="Memory Leaks" value={meta?.memoryLeaks?.length || 0} icon={Timer} status={(meta?.memoryLeaks?.length || 0) > 0 ? "bad" : "good"} onClick={() => setActiveDetail("memory-leaks")} />
+            <MetricCard label="Tech Debt" value={meta?.complexity?.technicalDebt || "0d"} icon={Brain} status="neutral" onClick={() => setActiveDetail("tech-debt")} />
           </div>
 
-          {/* Anti-pattern + Complexity summary */}
+          {/* Anti-pattern + Complexity summary — ALL CLICKABLE */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <MetricCard label="Anti-patterns" value={meta?.antiPatterns?.length || 0} icon={AlertOctagon} status={(meta?.antiPatterns?.length || 0) > 5 ? "warn" : "good"} />
-            <MetricCard label="Async Issues" value={meta?.asyncIssues?.length || 0} icon={Timer} status={(meta?.asyncIssues?.length || 0) > 0 ? "warn" : "good"} />
-            <MetricCard label="Avg Complexity" value={meta?.complexity?.avgCyclomaticComplexity?.toFixed(1) || "—"} icon={Brain} status={(meta?.complexity?.avgCyclomaticComplexity || 0) > 10 ? "warn" : "good"} />
-            <MetricCard label="Max Complexity" value={meta?.complexity?.maxCyclomaticComplexity || 0} icon={Brain} status={(meta?.complexity?.maxCyclomaticComplexity || 0) > 20 ? "bad" : "good"} />
+            <MetricCard label="Anti-patterns" value={meta?.antiPatterns?.length || 0} icon={AlertOctagon} status={(meta?.antiPatterns?.length || 0) > 5 ? "warn" : "good"} onClick={() => setActiveDetail("anti-patterns")} />
+            <MetricCard label="Async Issues" value={meta?.asyncIssues?.length || 0} icon={Timer} status={(meta?.asyncIssues?.length || 0) > 0 ? "warn" : "good"} onClick={() => setActiveDetail("async-issues")} />
+            <MetricCard label="Avg Complexity" value={meta?.complexity?.avgCyclomaticComplexity?.toFixed(1) || "—"} icon={Brain} status={(meta?.complexity?.avgCyclomaticComplexity || 0) > 10 ? "warn" : "good"} onClick={() => setActiveDetail("complexity:avg")} />
+            <MetricCard label="Max Complexity" value={meta?.complexity?.maxCyclomaticComplexity || 0} icon={Brain} status={(meta?.complexity?.maxCyclomaticComplexity || 0) > 20 ? "bad" : "good"} onClick={() => setActiveDetail("complexity:max")} />
           </div>
 
           {/* Category Breakdown Chart */}
@@ -152,17 +175,16 @@ export default function CodeQualityPage() {
         </div>
       )}
 
-      {/* ── COMPLEXITY TAB ── */}
+      {/* ── COMPLEXITY TAB — ALL CLICKABLE ── */}
       {activeTab === "complexity" && meta?.complexity && (
         <div className="space-y-6">
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <MetricCard label="Avg Cyclomatic" value={meta.complexity.avgCyclomaticComplexity.toFixed(1)} icon={Brain} status={meta.complexity.avgCyclomaticComplexity > 10 ? "warn" : "good"} />
-            <MetricCard label="Max Cyclomatic" value={meta.complexity.maxCyclomaticComplexity} icon={Brain} status={meta.complexity.maxCyclomaticComplexity > 25 ? "bad" : "good"} />
-            <MetricCard label="Avg Cognitive" value={meta.complexity.avgCognitiveComplexity.toFixed(1)} icon={Brain} status={meta.complexity.avgCognitiveComplexity > 15 ? "warn" : "good"} />
-            <MetricCard label="Duplicate Blocks" value={meta.complexity.duplicateBlocks} icon={FileCode} status={meta.complexity.duplicateBlocks > 10 ? "warn" : "good"} />
+            <MetricCard label="Avg Cyclomatic" value={meta.complexity.avgCyclomaticComplexity.toFixed(1)} icon={Brain} status={meta.complexity.avgCyclomaticComplexity > 10 ? "warn" : "good"} onClick={() => setActiveDetail("complexity:avg")} />
+            <MetricCard label="Max Cyclomatic" value={meta.complexity.maxCyclomaticComplexity} icon={Brain} status={meta.complexity.maxCyclomaticComplexity > 25 ? "bad" : "good"} onClick={() => setActiveDetail("complexity:max")} />
+            <MetricCard label="Avg Cognitive" value={meta.complexity.avgCognitiveComplexity.toFixed(1)} icon={Brain} status={meta.complexity.avgCognitiveComplexity > 15 ? "warn" : "good"} onClick={() => setActiveDetail("complexity:full")} />
+            <MetricCard label="Duplicate Blocks" value={meta.complexity.duplicateBlocks} icon={FileCode} status={meta.complexity.duplicateBlocks > 10 ? "warn" : "good"} onClick={() => setActiveDetail("complexity:duplicate")} />
           </div>
 
-          {/* Complexity findings */}
           <div className="card">
             <div className="px-5 py-4 border-b border-white/[0.06]">
               <h3 className="text-sm font-semibold text-gray-200">High Complexity Functions</h3>
@@ -176,15 +198,15 @@ export default function CodeQualityPage() {
         </div>
       )}
 
-      {/* ── MEMORY & ASYNC TAB ── */}
+      {/* ── MEMORY & ASYNC TAB — ALL CLICKABLE ── */}
       {activeTab === "leaks" && (
         <div className="space-y-6">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {/* Memory Leaks */}
-            <div className="card">
+            <button onClick={() => setActiveDetail("memory-leaks")} className="card text-left w-full cursor-pointer hover:bg-white/[0.04] hover:border-brand-500/30 transition-all group">
               <div className="px-5 py-4 border-b border-white/[0.06]">
                 <h3 className="text-sm font-semibold text-gray-200 flex items-center gap-2">
                   <Timer className="w-4 h-4 text-red-400" /> Memory Leak Flags ({meta?.memoryLeaks?.length || 0})
+                  <span className="text-[10px] text-gray-600 group-hover:text-brand-400 transition-colors ml-auto">Click for details</span>
                 </h3>
               </div>
               <div className="max-h-[400px] overflow-y-auto">
@@ -202,13 +224,13 @@ export default function CodeQualityPage() {
                   <div className="p-6 text-center text-gray-500 text-sm">No memory leaks detected</div>
                 )}
               </div>
-            </div>
+            </button>
 
-            {/* Async Issues */}
-            <div className="card">
+            <button onClick={() => setActiveDetail("async-issues")} className="card text-left w-full cursor-pointer hover:bg-white/[0.04] hover:border-brand-500/30 transition-all group">
               <div className="px-5 py-4 border-b border-white/[0.06]">
                 <h3 className="text-sm font-semibold text-gray-200 flex items-center gap-2">
                   <AlertOctagon className="w-4 h-4 text-amber-400" /> Async Issues ({meta?.asyncIssues?.length || 0})
+                  <span className="text-[10px] text-gray-600 group-hover:text-brand-400 transition-colors ml-auto">Click for details</span>
                 </h3>
               </div>
               <div className="max-h-[400px] overflow-y-auto">
@@ -226,7 +248,7 @@ export default function CodeQualityPage() {
                   <div className="p-6 text-center text-gray-500 text-sm">No async issues detected</div>
                 )}
               </div>
-            </div>
+            </button>
           </div>
         </div>
       )}
@@ -265,7 +287,6 @@ export default function CodeQualityPage() {
             </div>
           </div>
 
-          {/* File table */}
           <div className="card">
             <table className="data-table">
               <thead>
@@ -293,6 +314,42 @@ export default function CodeQualityPage() {
 
       {/* ── RAW JSON ── */}
       {activeTab === "raw" && <JsonViewer data={codeQualityResult} defaultExpanded maxHeight={600} />}
+
+      {/* ── DETAIL DRAWER ── */}
+      <DetailDrawer
+        title={drawerInfo.title}
+        subtitle={drawerInfo.subtitle}
+        isOpen={!!activeDetail}
+        onClose={() => setActiveDetail(null)}
+      >
+        {activeDetail?.startsWith("lint:") && meta?.lintResults && (
+          <LintDetail lintResults={meta.lintResults} findings={findings} focusType={activeDetail.replace("lint:", "") as "errors" | "warnings" | "fixable"} />
+        )}
+
+        {activeDetail === "dead-code" && (
+          <DeadCodeDetail deadCode={meta?.deadCode || []} />
+        )}
+
+        {activeDetail === "memory-leaks" && (
+          <MemoryLeakDetail memoryLeaks={meta?.memoryLeaks || []} />
+        )}
+
+        {activeDetail === "async-issues" && (
+          <AsyncDetail asyncIssues={meta?.asyncIssues || []} />
+        )}
+
+        {activeDetail === "anti-patterns" && (
+          <AntiPatternDetail antiPatterns={meta?.antiPatterns || []} />
+        )}
+
+        {(activeDetail === "complexity:avg" || activeDetail === "complexity:max" || activeDetail === "complexity:full" || activeDetail === "complexity:duplicate") && meta?.complexity && (
+          <ComplexityDetail complexity={meta.complexity} findings={findings} focusType={activeDetail === "complexity:avg" ? "avg" : activeDetail === "complexity:max" ? "max" : undefined} />
+        )}
+
+        {activeDetail === "tech-debt" && meta?.complexity && (
+          <ComplexityDetail complexity={meta.complexity} findings={findings} />
+        )}
+      </DetailDrawer>
     </div>
   );
 }

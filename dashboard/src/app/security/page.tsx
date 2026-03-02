@@ -11,6 +11,7 @@ import { SeverityPie } from "@/components/charts/severity-pie";
 import { MetricCard } from "@/components/cards/metric-card";
 import { FindingRow } from "@/components/cards/finding-row";
 import { JsonViewer } from "@/components/shared/json-viewer";
+import { DetailDrawer as SharedDetailDrawer } from "@/components/shared/detail-drawer";
 import { useScanReport } from "@/hooks/use-scan-report";
 import { createJiraTicket } from "@/lib/api";
 import { cn, getSeverityBg } from "@/lib/utils";
@@ -72,6 +73,16 @@ export default function SecurityPage() {
   };
 
   const closeDrawer = () => { setActiveDetail(null); setActiveOwasp(null); };
+
+  const drawerTitles: Record<string, string> = {
+    ssl: "SSL / TLS Analysis",
+    headers: "Security Headers Analysis",
+    "missing-headers": "Missing Security Headers",
+    cors: "CORS Configuration",
+    tokens: "Token Leak Detection",
+    deps: "Dependency Vulnerabilities",
+    drm: "DRM Protection Details",
+  };
 
   const tabs = [
     { id: "overview" as const, label: "Overview" },
@@ -363,65 +374,20 @@ export default function SecurityPage() {
       )}
 
       {/* ── DETAIL DRAWER (slide-over from right) ── */}
-      {activeDetail && (
-        <DetailDrawer meta={meta} detailType={activeDetail} onClose={closeDrawer} findings={findings} />
-      )}
+      <SharedDetailDrawer
+        title={drawerTitles[activeDetail || ""] || ""}
+        isOpen={!!activeDetail}
+        onClose={closeDrawer}
+      >
+        {activeDetail === "ssl" && <SSLDetail data={meta?.sslAnalysis} />}
+        {activeDetail === "headers" && <HeadersDetail data={meta?.headerAnalysis} />}
+        {activeDetail === "missing-headers" && <MissingHeadersDetail data={meta?.headerAnalysis} />}
+        {activeDetail === "cors" && <CORSDetail data={meta?.corsAnalysis} />}
+        {activeDetail === "tokens" && <TokenLeaksDetail data={meta?.tokenLeaks} />}
+        {activeDetail === "deps" && <DepsDetail data={meta?.dependencyVulns} />}
+        {activeDetail === "drm" && <DRMDetail data={meta?.drmAnalysis} findings={findings} />}
+      </SharedDetailDrawer>
     </div>
-  );
-}
-
-// ============================================================================
-// Detail Drawer — Slide-over panel with full detail info
-// ============================================================================
-function DetailDrawer({
-  meta,
-  detailType,
-  onClose,
-  findings,
-}: {
-  meta: SecurityMetadata;
-  detailType: DetailType;
-  onClose: () => void;
-  findings: Finding[];
-}) {
-  if (!detailType) return null;
-
-  const titles: Record<string, string> = {
-    ssl: "SSL / TLS Analysis",
-    headers: "Security Headers Analysis",
-    "missing-headers": "Missing Security Headers",
-    cors: "CORS Configuration",
-    tokens: "Token Leak Detection",
-    deps: "Dependency Vulnerabilities",
-    drm: "DRM Protection Details",
-  };
-
-  return (
-    <>
-      {/* Backdrop */}
-      <div className="fixed inset-0 bg-black/60 z-40" onClick={onClose} />
-      {/* Panel */}
-      <div className="fixed right-0 top-0 h-full w-full max-w-lg bg-surface-0 border-l border-white/[0.06] z-50 flex flex-col animate-slide-in-right overflow-hidden">
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.06] shrink-0">
-          <h2 className="text-sm font-bold text-gray-100">{titles[detailType]}</h2>
-          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-white/[0.06] text-gray-400 hover:text-gray-200 transition-colors">
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
-          {detailType === "ssl" && <SSLDetail data={meta?.sslAnalysis} />}
-          {detailType === "headers" && <HeadersDetail data={meta?.headerAnalysis} />}
-          {detailType === "missing-headers" && <MissingHeadersDetail data={meta?.headerAnalysis} />}
-          {detailType === "cors" && <CORSDetail data={meta?.corsAnalysis} />}
-          {detailType === "tokens" && <TokenLeaksDetail data={meta?.tokenLeaks} />}
-          {detailType === "deps" && <DepsDetail data={meta?.dependencyVulns} />}
-          {detailType === "drm" && <DRMDetail data={meta?.drmAnalysis} findings={findings} />}
-        </div>
-      </div>
-    </>
   );
 }
 

@@ -1,0 +1,56 @@
+# =============================================================================
+# VZY OTT Agent - Docker Build Exclusions
+# =============================================================================
+
+# Version control
+.git
+.gitignore
+
+# Node modules (rebuilt in container)
+node_modules
+dashboard/node_modules
+
+# Build artifacts
+dist
+dashboard/.next
+dashboard/out
+
+# Development files
+*.md
+LICENSE
+.eslintrc*
+.prettierrc*
+jest.config*
+tsconfig.tsbuildinfo
+
+# Logs & scan results (mounted as volumes)
+logs/
+scan-results/
+
+# Environment files (passed via env_file or secrets)
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# Infrastructure (not needed in container)
+infra/
+.github/
+scripts/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files (prevent recursive builds)
+docker-compose*.yml
+Dockerfile*
+
+# Claude/AI
+.claude/

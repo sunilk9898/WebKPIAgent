@@ -10,8 +10,17 @@ const PUBLIC_PATHS = ["/login", "/api/auth", "/_next", "/favicon.ico"];
 export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  // Allow public paths
+  // Allow public paths (but redirect /login to / if already authenticated)
   if (PUBLIC_PATHS.some((p) => pathname.startsWith(p))) {
+    // If user has a token and is visiting /login, redirect to home
+    if (pathname === "/login") {
+      const token =
+        request.cookies.get("vzy_token")?.value ||
+        request.headers.get("Authorization")?.replace("Bearer ", "");
+      if (token) {
+        return NextResponse.redirect(new URL("/", request.url));
+      }
+    }
     return NextResponse.next();
   }
 
