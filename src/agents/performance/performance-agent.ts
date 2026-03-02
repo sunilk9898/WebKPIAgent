@@ -37,12 +37,19 @@ const THRESHOLDS = {
   timeToFirstFrame: 4000, // ms
 };
 
-// ── Lighthouse configuration matching Chrome DevTools defaults exactly ──
-// Source: lighthouse/core/config/desktop-config.js (Lighthouse 12.x)
+// ── Lighthouse configuration ──
+// Uses 'devtools' throttling instead of default 'simulate' (Lantern) because
+// Lantern's trace engine fails consistently in Docker/Chromium with
+// "LanternError: missing metric scores for specified navigation".
+//
+// With throttlingMethod: 'devtools', Chrome DevTools Protocol applies
+// throttling directly — no trace processing needed, no LanternError possible.
+// This produces consistent scores across all environments.
 const LIGHTHOUSE_DESKTOP_CONFIG = {
   extends: 'lighthouse:default' as const,
   settings: {
     formFactor: 'desktop' as const,
+    throttlingMethod: 'devtools' as const,
     throttling: {
       rttMs: 40,
       throughputKbps: 10240,
@@ -68,6 +75,7 @@ const LIGHTHOUSE_MOBILE_CONFIG = {
   extends: 'lighthouse:default' as const,
   settings: {
     formFactor: 'mobile' as const,
+    throttlingMethod: 'devtools' as const,
     throttling: {
       rttMs: 150,
       throughputKbps: 1638.4,
