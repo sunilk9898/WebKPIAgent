@@ -62,5 +62,5 @@ EXPOSE 3000 9090
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
   CMD node -e "require('http').get('http://localhost:3000/api/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) })"
 
-# Default: run scheduler + dashboard
-CMD ["node", "dist/scheduler/cron.js"]
+# Run dashboard API server (port 3000) which also initializes the scheduler
+CMD ["node", "dist/dashboard/server.js"]
