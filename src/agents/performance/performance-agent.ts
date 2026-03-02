@@ -37,19 +37,14 @@ const THRESHOLDS = {
   timeToFirstFrame: 4000, // ms
 };
 
-// ── Lighthouse configuration ──
-// Uses 'devtools' throttling instead of default 'simulate' (Lantern) because
-// Lantern's trace engine fails consistently in Docker/Chromium with
-// "LanternError: missing metric scores for specified navigation".
-//
-// With throttlingMethod: 'devtools', Chrome DevTools Protocol applies
-// throttling directly — no trace processing needed, no LanternError possible.
-// This produces consistent scores across all environments.
+// ── Lighthouse configuration matching Chrome DevTools defaults exactly ──
+// Uses 'simulate' (Lantern) throttling for hardware-independent scores.
+// Lantern requires complete trace data — the anti-backgrounding Chrome flags
+// above ensure performance marks are emitted in headless/Docker mode.
 const LIGHTHOUSE_DESKTOP_CONFIG = {
   extends: 'lighthouse:default' as const,
   settings: {
     formFactor: 'desktop' as const,
-    throttlingMethod: 'devtools' as const,
     throttling: {
       rttMs: 40,
       throughputKbps: 10240,
@@ -75,7 +70,6 @@ const LIGHTHOUSE_MOBILE_CONFIG = {
   extends: 'lighthouse:default' as const,
   settings: {
     formFactor: 'mobile' as const,
-    throttlingMethod: 'devtools' as const,
     throttling: {
       rttMs: 150,
       throughputKbps: 1638.4,
@@ -101,22 +95,27 @@ const LIGHTHOUSE_MAX_RETRIES = 3;
 
 // Chrome flags for Lighthouse via chrome-launcher.
 //
-// CRITICAL: We use ignoreDefaultFlags: true when launching Chrome because
-// chrome-launcher's defaults include --disable-background-networking and
-// --metrics-recording-only, both of which break Lighthouse's Lantern trace
-// engine (causes LanternError: missing metric scores for specified navigation).
+// CRITICAL: We use ignoreDefaultFlags: true because chrome-launcher's defaults
+// include --disable-background-networking and --metrics-recording-only, both of
+// which break Lighthouse's Lantern trace engine.
 //
-// Keep this list MINIMAL. Additional problematic flags:
-//   - DO NOT use --single-process or --no-zygote (breaks multi-process tracing)
-//   - DO NOT use --disable-dev-shm-usage IF shm_size >= 1gb (forces slow /tmp)
+// However, we MUST include the anti-backgrounding flags below. Without them,
+// Chrome in headless mode treats the renderer as "backgrounded/occluded" and
+// throttles timer/IPC events — causing performance marks (FCP, LCP) to be
+// missing from the trace → LanternError.
 //
-// With docker-compose shm_size: 2gb, Chrome can use fast /dev/shm for IPC.
+// With docker-compose shm_size: 2gb, Chrome uses fast /dev/shm for IPC.
 const CHROME_FLAGS = [
   '--headless=new',
   '--no-sandbox',
   '--disable-gpu',
   '--no-first-run',
   '--disable-extensions',
+  // Anti-backgrounding: prevent Chrome from throttling renderer in headless mode
+  '--disable-renderer-backgrounding',
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-ipc-flooding-protection',
 ];
 
 // Puppeteer-specific flags (superset of CHROME_FLAGS for non-Lighthouse uses)
