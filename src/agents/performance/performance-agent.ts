@@ -95,27 +95,43 @@ const LIGHTHOUSE_MAX_RETRIES = 3;
 
 // Chrome flags for Lighthouse via chrome-launcher.
 //
-// CRITICAL: We use ignoreDefaultFlags: true because chrome-launcher's defaults
-// include --disable-background-networking and --metrics-recording-only, both of
-// which break Lighthouse's Lantern trace engine.
+// We use ignoreDefaultFlags: true because chrome-launcher's defaults include
+// --disable-background-networking and --metrics-recording-only, both of which
+// break Lighthouse's Lantern trace engine (LanternError).
 //
-// However, we MUST include the anti-backgrounding flags below. Without them,
-// Chrome in headless mode treats the renderer as "backgrounded/occluded" and
-// throttles timer/IPC events — causing performance marks (FCP, LCP) to be
-// missing from the trace → LanternError.
-//
-// With docker-compose shm_size: 2gb, Chrome uses fast /dev/shm for IPC.
+// Below we re-include ALL safe defaults from chrome-launcher EXCEPT those two,
+// plus anti-backgrounding flags essential for headless trace collection.
 const CHROME_FLAGS = [
   '--headless=new',
   '--no-sandbox',
   '--disable-gpu',
   '--no-first-run',
   '--disable-extensions',
-  // Anti-backgrounding: prevent Chrome from throttling renderer in headless mode
+  // Anti-backgrounding: prevent renderer throttling in headless mode
+  // (without these, performance marks FCP/LCP are missing from traces)
   '--disable-renderer-backgrounding',
   '--disable-background-timer-throttling',
   '--disable-backgrounding-occluded-windows',
   '--disable-ipc-flooding-protection',
+  // Safe chrome-launcher defaults (reduce noise in Lantern network trace)
+  '--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion,InterestFeedContentSuggestions,CertificateTransparencyComponentUpdater,AutofillServerCommunication,PrivacySandboxSettings4',
+  '--disable-component-extensions-with-background-pages',
+  '--disable-component-update',
+  '--disable-client-side-phishing-detection',
+  '--disable-sync',
+  '--disable-default-apps',
+  '--disable-domain-reliability',
+  '--disable-hang-monitor',
+  '--disable-prompt-on-repost',
+  '--mute-audio',
+  '--no-default-browser-check',
+  '--password-store=basic',
+  '--use-mock-keychain',
+  '--force-fieldtrials=*BackgroundTracing/default/',
+  '--propagate-iph-for-testing',
+  // Explicitly NOT included (these break Lantern trace engine):
+  // --disable-background-networking
+  // --metrics-recording-only
 ];
 
 // Puppeteer-specific flags (superset of CHROME_FLAGS for non-Lighthouse uses)
