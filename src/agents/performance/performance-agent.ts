@@ -92,6 +92,9 @@ const LIGHTHOUSE_MOBILE_CONFIG = {
 const LIGHTHOUSE_MAX_RETRIES = 3;
 
 // Chrome flags optimized for Docker/headless containers
+// NOTE: --single-process and --no-zygote MUST NOT be used — they break
+// Lighthouse tracing (causes LanternError / performance mark errors).
+// Chrome needs its multi-process architecture for proper page traces.
 const CHROME_FLAGS = [
   '--headless',
   '--no-sandbox',
@@ -104,8 +107,6 @@ const CHROME_FLAGS = [
   '--disable-default-apps',
   '--disable-sync',
   '--no-first-run',
-  '--no-zygote',           // Critical for Docker: avoids fork issues
-  '--single-process',      // Reduces memory overhead in containers
   '--disable-translate',
   '--metrics-recording-only',
   '--mute-audio',
@@ -140,7 +141,7 @@ export class PerformanceAgent extends BaseAgent {
     // Warm up Chrome by loading a simple page first
     // This prevents LanternError on first real scan in Docker
     try {
-      const warmupResult = await lighthouse('data:text/html,<h1>warmup</h1>', {
+      const warmupResult = await lighthouse('https://example.com', {
         port: this.chrome.port,
         output: 'json',
         logLevel: 'error',
@@ -148,7 +149,7 @@ export class PerformanceAgent extends BaseAgent {
         extends: 'lighthouse:default' as const,
         settings: {
           onlyCategories: ['performance'],
-          maxWaitForLoad: 5000,
+          maxWaitForLoad: 10000,
         },
       });
       this.logger.info('Chrome warm-up complete');
