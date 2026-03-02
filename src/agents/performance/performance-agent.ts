@@ -91,14 +91,15 @@ const LIGHTHOUSE_MOBILE_CONFIG = {
 // Max retry attempts for Lighthouse when it returns 0/null
 const LIGHTHOUSE_MAX_RETRIES = 3;
 
-// Chrome flags for Docker/headless containers.
+// Chrome flags for Lighthouse via chrome-launcher.
 //
-// IMPORTANT: Keep this list MINIMAL. Extra flags can break Lighthouse's
-// Lantern trace engine (LanternError: missing metric scores).
-// Specifically:
+// CRITICAL: We use ignoreDefaultFlags: true when launching Chrome because
+// chrome-launcher's defaults include --disable-background-networking and
+// --metrics-recording-only, both of which break Lighthouse's Lantern trace
+// engine (causes LanternError: missing metric scores for specified navigation).
+//
+// Keep this list MINIMAL. Additional problematic flags:
 //   - DO NOT use --single-process or --no-zygote (breaks multi-process tracing)
-//   - DO NOT use --metrics-recording-only (limits trace events Lighthouse needs)
-//   - DO NOT use --disable-background-networking (breaks network trace data)
 //   - DO NOT use --disable-dev-shm-usage IF shm_size >= 1gb (forces slow /tmp)
 //
 // With docker-compose shm_size: 2gb, Chrome can use fast /dev/shm for IPC.
@@ -142,6 +143,7 @@ export class PerformanceAgent extends BaseAgent {
 
     this.chrome = await chromeLauncher.launch({
       chromeFlags: CHROME_FLAGS,
+      ignoreDefaultFlags: true, // prevent chrome-launcher from adding --disable-background-networking & --metrics-recording-only
       ...(chromePath ? { chromePath } : {}),
     });
 
@@ -252,6 +254,7 @@ export class PerformanceAgent extends BaseAgent {
           const chromePath = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
           this.chrome = await chromeLauncher.launch({
             chromeFlags: CHROME_FLAGS,
+            ignoreDefaultFlags: true,
             ...(chromePath ? { chromePath } : {}),
           });
           // Brief pause to let Chrome stabilize
@@ -268,6 +271,7 @@ export class PerformanceAgent extends BaseAgent {
           const chromePath2 = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
           this.chrome = await chromeLauncher.launch({
             chromeFlags: CHROME_FLAGS,
+            ignoreDefaultFlags: true,
             ...(chromePath2 ? { chromePath: chromePath2 } : {}),
           });
           await new Promise(resolve => setTimeout(resolve, 2000));
@@ -287,6 +291,7 @@ export class PerformanceAgent extends BaseAgent {
             const chromePath3 = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
             this.chrome = await chromeLauncher.launch({
               chromeFlags: CHROME_FLAGS,
+              ignoreDefaultFlags: true,
               ...(chromePath3 ? { chromePath: chromePath3 } : {}),
             });
             await new Promise(resolve => setTimeout(resolve, 2000));
