@@ -155,7 +155,7 @@ export interface SecurityMetadata {
 
 // -- Performance-specific metadata --
 export interface PerformanceMetadata {
-  lighthouse: { performanceScore: number; accessibilityScore: number; bestPracticesScore: number; seoScore: number; pwaScore: number };
+  lighthouse: { performanceScore: number; accessibilityScore: number; bestPracticesScore: number; seoScore: number; pwaScore: number; estimated?: boolean };
   coreWebVitals: Record<string, { value: number; rating: "good" | "needs-improvement" | "poor" }>;
   playerMetrics: { startupDelay: number; bufferRatio: number; abrSwitchCount: number; abrSwitchLatency: number; rebufferEvents: number; playbackFailures: number; drmLicenseTime: number; timeToFirstFrame: number };
   cdnMetrics: { hitRatio: number; avgLatency: number; p95Latency: number; edgeLocations: string[]; cacheHeaders: boolean; compressionEnabled: boolean };
