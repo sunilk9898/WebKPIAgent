@@ -293,17 +293,14 @@ export class PerformanceAgent extends BaseAgent {
     }
     this._activeBrowsers = [];
 
-    // Kill chrome-launcher instance (Lighthouse)
+    // Kill chrome-launcher instance (Lighthouse) — uses the specific pid, safe for concurrency
     if (this.chrome) {
       try { await this.chrome.kill(); } catch { /* already dead */ }
       this.chrome = undefined;
     }
 
-    // Belt-and-suspenders: force-kill any leftover Chrome processes via pid
-    try {
-      const { execSync } = require('child_process');
-      execSync('pkill -f "chrome.*--headless" 2>/dev/null || true', { timeout: 3000 });
-    } catch { /* non-critical */ }
+    // NOTE: Do NOT pkill all chrome processes — that kills other concurrent scans' Chrome.
+    // Each chrome-launcher/puppeteer instance tracks its own pid and cleans up via .kill()/.close().
   }
 
   // ---------------------------------------------------------------------------
@@ -340,6 +337,26 @@ export class PerformanceAgent extends BaseAgent {
         const lhr = result.lhr;
         // Round to avoid floating point artifacts (0.57 * 100 = 56.999... → 57)
         const perfScore = Math.round((lhr.categories.performance?.score || 0) * 100);
+
+        // Detailed logging when score is 0 — helps diagnose Docker/Chrome issues
+        if (perfScore === 0) {
+          const fcp = lhr.audits?.['first-contentful-paint']?.numericValue;
+          const lcp = lhr.audits?.['largest-contentful-paint']?.numericValue;
+          const si = lhr.audits?.['speed-index']?.numericValue;
+          const runtimeErrors = lhr.runtimeError?.code || 'none';
+          const categories = Object.keys(lhr.categories || {}).map(k => `${k}:${lhr.categories[k]?.score}`).join(', ');
+          this.logger.warn(`Lighthouse score=0 diagnostics`, {
+            platform,
+            attempt,
+            chromePort: this.chrome?.port,
+            runtimeError: runtimeErrors,
+            fcp: fcp || 'missing',
+            lcp: lcp || 'missing',
+            speedIndex: si || 'missing',
+            categories,
+            auditsCount: Object.keys(lhr.audits || {}).length,
+          });
+        }
 
         // Track best score across attempts (Docker/container scans can be flaky)
         if (perfScore > bestScore) {
@@ -1005,9 +1022,26 @@ export class PerformanceAgent extends BaseAgent {
         ? mobileLH
         : null;
 
-    let lighthouseActual = 75; // full score if no Lighthouse data at all
+    let lighthouseActual: number;
     if (primaryLHScore !== null) {
+      // Normal case: Lighthouse returned a valid score
       lighthouseActual = Math.round((primaryLHScore / 100) * 75 * 100) / 100;
+    } else {
+      // Lighthouse FAILED — estimate from CWV data if available, otherwise use 50% as penalty
+      // We can't give full marks when Lighthouse didn't actually run.
+      const cwvLcp = this._cwvValuesMap['desktop']?.lcp?.value || this._cwvValuesMap['mweb']?.lcp?.value || 0;
+      const cwvFcp = this._cwvValuesMap['desktop']?.fcp?.value || this._cwvValuesMap['mweb']?.fcp?.value || 0;
+      if (cwvLcp > 0 || cwvFcp > 0) {
+        // Estimate a rough Lighthouse-equivalent score from CWV metrics
+        // LCP <2.5s = good (90+), <4s = needs-improvement (50-89), >4s = poor (<50)
+        const lcpScore = cwvLcp <= 2500 ? 90 : cwvLcp <= 4000 ? Math.round(90 - ((cwvLcp - 2500) / 1500) * 40) : Math.max(10, Math.round(50 - ((cwvLcp - 4000) / 4000) * 40));
+        lighthouseActual = Math.round((lcpScore / 100) * 75 * 100) / 100;
+        this.logger.warn(`Lighthouse failed — estimated score from CWV LCP (${cwvLcp}ms → ~${lcpScore}/100 → ${lighthouseActual}/75)`);
+      } else {
+        // No CWV data either — use 50% as a neutral penalty (37.5/75)
+        lighthouseActual = 37.5;
+        this.logger.warn('Lighthouse failed and no CWV data available — using 50% default (37.5/75)');
+      }
     }
     const lighthouseAuditFindings = this.findings.filter((f) => f.category === 'Lighthouse Audit');
 

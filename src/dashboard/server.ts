@@ -50,7 +50,11 @@ interface QueuedScanJob {
   error?: string;
 }
 
-const MAX_CONCURRENT_SCANS = 2;
+// On 4-vCPU/8GB EC2: only 1 concurrent scan to avoid Chrome resource contention.
+// Each scan needs multiple Chrome instances (Lighthouse, CWV, CDN, Resource)
+// and Lighthouse requires stable CPU/memory for accurate trace collection.
+// Increase to 2 when running on 8+ vCPU instances.
+const MAX_CONCURRENT_SCANS = 1;
 const scanQueue: QueuedScanJob[] = [];
 const activeJobs = new Map<string, {
   job: QueuedScanJob;
@@ -111,18 +115,14 @@ function checkBatchComplete(batchId: string): void {
   }
 }
 
-/** Kill all Chrome/Chromium processes spawned by a scan (best-effort). */
-function killOrphanChromeProcesses(scanId: string): void {
-  try {
-    const { execSync } = require('child_process');
-    // Find chrome/chromium processes and kill them — safe because each scan
-    // runs in its own short-lived Chrome instances. On a dedicated scan server
-    // the only Chrome processes are ours.
-    execSync('pkill -f "chrome.*--headless" || true', { timeout: 5000 });
-    logger.info(`Force-killed orphan Chrome processes after scan ${scanId}`);
-  } catch {
-    // Non-critical — process may already be gone
-  }
+/**
+ * Cleanup after a timed-out or aborted scan.
+ * NOTE: We do NOT pkill all Chrome processes — that would kill other concurrent scans' Chrome.
+ * Each agent's teardown handles its own Chrome instances via chrome-launcher .kill() and puppeteer .close().
+ * This function only logs the event; the agent teardown (with 10s timeout guard) handles the actual cleanup.
+ */
+function logScanCleanup(scanId: string, reason: string): void {
+  logger.info(`Scan cleanup: ${scanId} (${reason}) — agent teardown will handle Chrome processes`);
 }
 
 async function executeScanJob(
@@ -198,9 +198,9 @@ async function executeScanJob(
       emitBatchProgress(job);
     }
 
-    // Force-kill orphan Chrome processes when scan times out or fails
+    // Log cleanup — agent teardown handles Chrome via pid-specific .kill()/.close()
     if (timedOut || abortController.signal.aborted) {
-      killOrphanChromeProcesses(job.scanId);
+      logScanCleanup(job.scanId, timedOut ? 'timeout' : 'aborted');
     }
 
     logger.error(`Scan failed: ${job.url}`, { error: errMsg });
