@@ -40,9 +40,9 @@ services:
       NODE_ENV: production
       DATABASE_URL: postgresql://vzy:${DB_PASSWORD}@postgres:5432/vzy_agent
       REDIS_URL: redis://redis:6379
-      # Chrome/Lighthouse Docker flags
-      CHROME_PATH: /usr/bin/chromium
-      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+      # Chrome/Lighthouse Docker flags (Google Chrome, not Chromium)
+      CHROME_PATH: /usr/bin/google-chrome-stable
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome-stable
     # Chrome needs large /dev/shm for stable tracing (default 64MB is too small)
     shm_size: '2gb'
     volumes:
