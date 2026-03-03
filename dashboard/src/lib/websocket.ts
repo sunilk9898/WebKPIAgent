@@ -5,7 +5,18 @@
 import { io, Socket } from "socket.io-client";
 import type { WSScanComplete, WSScanError, WSScanProgress } from "@/types/api";
 
-const WS_URL = process.env.WS_URL || process.env.NEXT_PUBLIC_WS_URL || "http://localhost:3001";
+// Derive WebSocket URL at runtime from the browser's current origin.
+// This avoids build-time baking issues with Next.js standalone mode.
+// In production (https://vzytech.com), nginx proxies /socket.io → agent:3000.
+// In development, the agent runs on localhost:3001.
+function getWsUrl(): string {
+  if (typeof window !== "undefined") {
+    // Browser: use current page origin (works for both dev and prod)
+    return window.location.origin;
+  }
+  return process.env.WS_URL || process.env.NEXT_PUBLIC_WS_URL || "http://localhost:3001";
+}
+const WS_URL = getWsUrl();
 
 let socket: Socket | null = null;
 
