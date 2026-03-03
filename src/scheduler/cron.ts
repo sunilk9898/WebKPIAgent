@@ -86,6 +86,13 @@ function loadScanConfigs(): ScanConfig[] {
 // Cron Scheduler
 // ---------------------------------------------------------------------------
 function startScheduler(): void {
+  // Guard: scheduler disabled by default — set SCHEDULER_ENABLED=true to enable
+  const schedulerEnabled = process.env.SCHEDULER_ENABLED === 'true';
+  if (!schedulerEnabled) {
+    logger.info('Scheduler disabled (SCHEDULER_ENABLED != true). Scans will only run on manual trigger.');
+    return;
+  }
+
   const cronExpression = process.env.SCAN_CRON || '0 2 * * *';  // Default: 2 AM daily
   const configs = loadScanConfigs();
 

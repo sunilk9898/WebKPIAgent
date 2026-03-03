@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { useReportStore, useAuthStore, useScanStore } from "@/lib/store";
+import { useReportStore, useAuthStore, useScanStore, useQueueStore } from "@/lib/store";
 import { getScoreStatus, timeAgo, cn } from "@/lib/utils";
 import { abortScan, getLatestReport, getScannedUrls, type ScannedUrlEntry } from "@/lib/api";
 import {
@@ -12,6 +12,7 @@ export function Header() {
   const { report, setReport } = useReportStore();
   const { user, logout } = useAuthStore();
   const { activeScan, setActiveScan } = useScanStore();
+  const { activeCount, queueLength } = useQueueStore();
 
   const [showUrlDropdown, setShowUrlDropdown] = useState(false);
   const [scannedUrls, setScannedUrls] = useState<ScannedUrlEntry[]>([]);
@@ -148,21 +149,28 @@ export function Header() {
           </>
         )}
 
-        {/* Active scan indicator with abort */}
-        {activeScan && (
+        {/* Active scan indicator — system-wide awareness */}
+        {(activeScan || activeCount > 0) && (
           <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-brand-600/15 border border-brand-500/30">
             <Loader2 className="w-3.5 h-3.5 text-brand-400 animate-spin" />
-            <span className="text-xs font-medium text-brand-400">Scanning...</span>
-            <button
-              onClick={async () => {
-                try { await abortScan(activeScan.scanId); } catch {}
-                setActiveScan(null);
-              }}
-              className="ml-1 p-0.5 rounded hover:bg-red-500/20 transition-colors"
-              title="Abort scan"
-            >
-              <StopCircle className="w-3.5 h-3.5 text-red-400" />
-            </button>
+            <span className="text-xs font-medium text-brand-400">
+              {activeCount} scan{activeCount !== 1 ? "s" : ""} active
+            </span>
+            {queueLength > 0 && (
+              <span className="text-xs text-gray-500">+{queueLength} queued</span>
+            )}
+            {activeScan && (
+              <button
+                onClick={async () => {
+                  try { await abortScan(activeScan.scanId); } catch {}
+                  setActiveScan(null);
+                }}
+                className="ml-1 p-0.5 rounded hover:bg-red-500/20 transition-colors"
+                title="Abort your scan"
+              >
+                <StopCircle className="w-3.5 h-3.5 text-red-400" />
+              </button>
+            )}
           </div>
         )}
       </div>

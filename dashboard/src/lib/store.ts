@@ -94,7 +94,7 @@ interface ScanStore {
   activeScan: ScanActivity | null;
   scanHistory: { scanId: string; score: number; status: string; timestamp: string }[];
   setActiveScan: (scan: ScanActivity | null) => void;
-  updateAgentProgress: (scanId: string, agent: AgentType, progress: number, status: ScanStatus) => void;
+  updateAgentProgress: (scanId: string, agent: AgentType | string, progress: number, status: ScanStatus) => void;
   completeScan: (scanId: string, score: number, status: string) => void;
 }
 
@@ -105,6 +105,22 @@ export const useScanStore = create<ScanStore>((set, get) => ({
   updateAgentProgress: (scanId, agent, progress, status) => {
     const current = get().activeScan;
     if (!current || current.scanId !== scanId) return;
+
+    // "all" is an overall progress marker — update overall status but skip agents map
+    if (agent === "all") {
+      set({
+        activeScan: {
+          ...current,
+          status: status === "completed" ? "completed" : current.status,
+        },
+      });
+      return;
+    }
+
+    // Only update known agent types
+    const knownAgents: AgentType[] = ["security", "performance", "code-quality", "report-generator"];
+    if (!knownAgents.includes(agent as AgentType)) return;
+
     set({
       activeScan: {
         ...current,
@@ -160,6 +176,85 @@ export const useBatchStore = create<BatchStore>((set) => ({
       ),
     })),
   clearBatch: () => set({ batchId: null, batchScans: [], batchRunning: false }),
+}));
+
+// ---------------------------------------------------------------------------
+// Scan Queue Store (system-wide real-time queue)
+// ---------------------------------------------------------------------------
+export interface ActiveScanInfo {
+  scanId: string;
+  url: string;
+  userEmail: string;
+  userName: string;
+  startedAt: string;
+  batchId?: string;
+}
+
+export interface QueuedScanInfo {
+  jobId: string;
+  scanId: string;
+  url: string;
+  userEmail: string;
+  userName: string;
+  queuedAt: string;
+  batchId?: string;
+}
+
+interface QueueStore {
+  activeScans: ActiveScanInfo[];
+  queuedScans: QueuedScanInfo[];
+  maxConcurrent: number;
+  activeCount: number;
+  queueLength: number;
+  setQueueStatus: (status: {
+    activeScans: ActiveScanInfo[];
+    queuedScans: QueuedScanInfo[];
+    maxConcurrent: number;
+    activeCount: number;
+    queueLength: number;
+  }) => void;
+}
+
+export const useQueueStore = create<QueueStore>((set) => ({
+  activeScans: [],
+  queuedScans: [],
+  maxConcurrent: 2,
+  activeCount: 0,
+  queueLength: 0,
+  setQueueStatus: (status) => set(status),
+}));
+
+// ---------------------------------------------------------------------------
+// Toast Notification Store
+// ---------------------------------------------------------------------------
+export interface Toast {
+  id: string;
+  type: "info" | "success" | "warning" | "error";
+  title: string;
+  message?: string;
+  duration?: number;
+  createdAt: number;
+}
+
+interface ToastStore {
+  toasts: Toast[];
+  addToast: (toast: Omit<Toast, "id" | "createdAt">) => void;
+  removeToast: (id: string) => void;
+}
+
+export const useToastStore = create<ToastStore>((set) => ({
+  toasts: [],
+  addToast: (toast) => {
+    const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const newToast: Toast = { ...toast, id, createdAt: Date.now() };
+    set((state) => ({ toasts: [...state.toasts, newToast] }));
+    // Auto-remove after duration
+    setTimeout(() => {
+      set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) }));
+    }, toast.duration || 5000);
+  },
+  removeToast: (id) =>
+    set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
 }));
 
 // ---------------------------------------------------------------------------

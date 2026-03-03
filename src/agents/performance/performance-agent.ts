@@ -90,8 +90,8 @@ const LIGHTHOUSE_MOBILE_CONFIG = {
   },
 };
 
-// Max retry attempts for Lighthouse when it returns 0/null
-const LIGHTHOUSE_MAX_RETRIES = 3;
+// Max retry attempts for Lighthouse when it returns 0/null (reduced from 3 to 2 for faster scans)
+const LIGHTHOUSE_MAX_RETRIES = 2;
 
 // Chrome flags for Lighthouse via chrome-launcher.
 //
@@ -146,6 +146,9 @@ const PUPPETEER_FLAGS = [
 export class PerformanceAgent extends BaseAgent {
   private browser?: Browser;
   private chrome?: chromeLauncher.LaunchedChrome;
+
+  // Track ALL launched Puppeteer browsers so teardown can kill them on timeout
+  private _activeBrowsers: Browser[] = [];
 
   // ── Metric collectors for metadata (per-platform to avoid overwrite) ──
   private _lhScoresMap: Record<string, { performance: number; accessibility: number; bestPractices: number; seo: number }> = {};
@@ -284,9 +287,23 @@ export class PerformanceAgent extends BaseAgent {
   }
 
   protected async teardown(): Promise<void> {
-    if (this.chrome) {
-      await this.chrome.kill();
+    // Close all tracked Puppeteer browsers (CWV, player, CDN, resource)
+    for (const b of this._activeBrowsers) {
+      try { await b.close(); } catch { /* already closed */ }
     }
+    this._activeBrowsers = [];
+
+    // Kill chrome-launcher instance (Lighthouse)
+    if (this.chrome) {
+      try { await this.chrome.kill(); } catch { /* already dead */ }
+      this.chrome = undefined;
+    }
+
+    // Belt-and-suspenders: force-kill any leftover Chrome processes via pid
+    try {
+      const { execSync } = require('child_process');
+      execSync('pkill -f "chrome.*--headless" 2>/dev/null || true', { timeout: 3000 });
+    } catch { /* non-critical */ }
   }
 
   // ---------------------------------------------------------------------------
@@ -474,6 +491,7 @@ export class PerformanceAgent extends BaseAgent {
         ...(platform === 'mweb' ? ['--window-size=375,812'] : ['--window-size=1350,940']),
       ],
     });
+    this._activeBrowsers.push(browser);
 
     try {
       const page = await browser.newPage();
@@ -507,11 +525,11 @@ export class PerformanceAgent extends BaseAgent {
       });
 
       const startTime = Date.now();
-      const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+      const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
       const ttfb = Date.now() - startTime;
 
-      // Wait for metrics to stabilize
-      await new Promise(resolve => setTimeout(resolve, 5000));
+      // Wait for metrics to stabilize (reduced from 5s to 3s for faster scans)
+      await new Promise(resolve => setTimeout(resolve, 3000));
 
       // Collect paint timing
       const paintTimings = await page.evaluate(() => {
@@ -582,6 +600,7 @@ export class PerformanceAgent extends BaseAgent {
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [...PUPPETEER_FLAGS, '--autoplay-policy=no-user-gesture-required'],
     });
+    this._activeBrowsers.push(browser);
 
     try {
       const page = await browser.newPage();
@@ -708,6 +727,7 @@ export class PerformanceAgent extends BaseAgent {
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: PUPPETEER_FLAGS,
     });
+    this._activeBrowsers.push(browser);
 
     try {
       const page = await browser.newPage();
@@ -796,6 +816,7 @@ export class PerformanceAgent extends BaseAgent {
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: PUPPETEER_FLAGS,
     });
+    this._activeBrowsers.push(browser);
 
     try {
       const page = await browser.newPage();

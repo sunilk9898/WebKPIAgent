@@ -29,6 +29,243 @@ process.on('unhandledRejection', (reason) => {
 // Track running scans so we can abort them
 const runningScans = new Map<string, { orchestrator: Orchestrator; abortController: AbortController }>();
 
+// ---------------------------------------------------------------------------
+// Scan Queue System — System-wide FIFO queue with max concurrency
+// ---------------------------------------------------------------------------
+interface QueuedScanJob {
+  jobId: string;
+  scanId: string;
+  type: 'single' | 'batch-entry';
+  batchId?: string;
+  url: string;
+  config: any;
+  userEmail: string;
+  userName: string;
+  userId: string;
+  status: 'queued' | 'running' | 'completed' | 'error';
+  queuedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  score?: number;
+  error?: string;
+}
+
+const MAX_CONCURRENT_SCANS = 2;
+const scanQueue: QueuedScanJob[] = [];
+const activeJobs = new Map<string, {
+  job: QueuedScanJob;
+  orchestrator: Orchestrator;
+  abortController: AbortController;
+}>();
+
+function broadcastQueueStatus(): void {
+  const status = {
+    activeScans: Array.from(activeJobs.values()).map(({ job }) => ({
+      scanId: job.scanId,
+      url: job.url,
+      userEmail: job.userEmail,
+      userName: job.userName,
+      startedAt: job.startedAt,
+      batchId: job.batchId,
+    })),
+    queuedScans: scanQueue.filter(j => j.status === 'queued').map(j => ({
+      jobId: j.jobId,
+      scanId: j.scanId,
+      url: j.url,
+      userEmail: j.userEmail,
+      userName: j.userName,
+      queuedAt: j.queuedAt,
+      batchId: j.batchId,
+    })),
+    maxConcurrent: MAX_CONCURRENT_SCANS,
+    activeCount: activeJobs.size,
+    queueLength: scanQueue.filter(j => j.status === 'queued').length,
+  };
+  io.emit('queue:status', status);
+}
+
+function emitBatchProgress(job: QueuedScanJob): void {
+  if (!job.batchId) return;
+  const batchJobs = scanQueue.filter(j => j.batchId === job.batchId);
+  const completed = batchJobs.filter(j => j.status === 'completed').length;
+  const errored = batchJobs.filter(j => j.status === 'error').length;
+
+  io.emit('batch:progress', {
+    batchId: job.batchId,
+    current: completed + errored,
+    total: batchJobs.length,
+    scanId: job.scanId,
+    url: job.url,
+    status: job.status,
+    score: job.score,
+    error: job.error,
+  });
+}
+
+function checkBatchComplete(batchId: string): void {
+  const batchJobs = scanQueue.filter(j => j.batchId === batchId);
+  const allDone = batchJobs.every(j => j.status === 'completed' || j.status === 'error');
+  if (allDone) {
+    io.emit('batch:complete', { batchId, total: batchJobs.length });
+    logger.info(`Batch scan completed: ${batchId} (${batchJobs.length} URLs)`);
+  }
+}
+
+/** Kill all Chrome/Chromium processes spawned by a scan (best-effort). */
+function killOrphanChromeProcesses(scanId: string): void {
+  try {
+    const { execSync } = require('child_process');
+    // Find chrome/chromium processes and kill them — safe because each scan
+    // runs in its own short-lived Chrome instances. On a dedicated scan server
+    // the only Chrome processes are ours.
+    execSync('pkill -f "chrome.*--headless" || true', { timeout: 5000 });
+    logger.info(`Force-killed orphan Chrome processes after scan ${scanId}`);
+  } catch {
+    // Non-critical — process may already be gone
+  }
+}
+
+async function executeScanJob(
+  job: QueuedScanJob,
+  orchestrator: Orchestrator,
+  abortController: AbortController,
+): Promise<void> {
+  const TIMEOUT = 480_000; // 8 minutes (increased: LH retries + 2 platforms + CWV)
+  let timeoutHandle: NodeJS.Timeout | undefined;
+  let timedOut = false;
+
+  // Wire up real-time progress events → WebSocket
+  orchestrator.onProgress((phase, agentType, progress, status) => {
+    io.emit('scan:progress', {
+      scanId: job.scanId,
+      agent: agentType,
+      progress,
+      status,
+      phase,
+    });
+  });
+
+  try {
+    const report = await Promise.race([
+      orchestrator.runScan(job.config),
+      new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(`Scan timeout after 8 minutes`));
+        }, TIMEOUT);
+      }),
+    ]);
+
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+
+    if (!abortController.signal.aborted) {
+      job.status = 'completed';
+      job.completedAt = new Date().toISOString();
+      job.score = report.kpiScore.overallScore;
+
+      io.emit('scan:complete', {
+        scanId: job.scanId,
+        url: job.url,
+        score: report.kpiScore.overallScore,
+        status: report.kpiScore.passesThreshold ? 'pass' : 'fail',
+        batchId: job.batchId,
+        userEmail: job.userEmail,
+        userName: job.userName,
+      });
+
+      if (job.batchId) {
+        emitBatchProgress(job);
+      }
+
+      logger.info(`Scan completed: ${job.url} → ${report.kpiScore.overallScore} (by ${job.userEmail})`);
+    }
+  } catch (error) {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    job.status = 'error';
+    job.completedAt = new Date().toISOString();
+    job.error = errMsg;
+
+    io.emit('scan:error', {
+      scanId: job.scanId,
+      url: job.url,
+      error: abortController.signal.aborted ? 'Scan aborted by user' : errMsg,
+      batchId: job.batchId,
+      userEmail: job.userEmail,
+    });
+
+    if (job.batchId) {
+      emitBatchProgress(job);
+    }
+
+    // Force-kill orphan Chrome processes when scan times out or fails
+    if (timedOut || abortController.signal.aborted) {
+      killOrphanChromeProcesses(job.scanId);
+    }
+
+    logger.error(`Scan failed: ${job.url}`, { error: errMsg });
+  } finally {
+    activeJobs.delete(job.scanId);
+    runningScans.delete(job.scanId);
+    broadcastQueueStatus();
+
+    // Check if batch is complete
+    if (job.batchId) {
+      checkBatchComplete(job.batchId);
+    }
+
+    // Process next in queue
+    processQueue();
+  }
+}
+
+function processQueue(): void {
+  while (activeJobs.size < MAX_CONCURRENT_SCANS) {
+    const nextJob = scanQueue.find(j => j.status === 'queued');
+    if (!nextJob) break;
+
+    nextJob.status = 'running';
+    nextJob.startedAt = new Date().toISOString();
+
+    const orchestrator = new Orchestrator();
+    const abortController = new AbortController();
+    activeJobs.set(nextJob.scanId, { job: nextJob, orchestrator, abortController });
+    // Also update the legacy runningScans map for abort endpoint compatibility
+    runningScans.set(nextJob.scanId, { orchestrator, abortController });
+
+    broadcastQueueStatus();
+
+    // Notify the specific user their scan started
+    io.to(`user:${nextJob.userId}`).emit('scan:started', {
+      scanId: nextJob.scanId,
+      jobId: nextJob.jobId,
+      url: nextJob.url,
+    });
+
+    logger.info(`Scan started: ${nextJob.url} (by ${nextJob.userEmail}, queue: ${scanQueue.filter(j => j.status === 'queued').length} remaining)`);
+
+    // Run scan asynchronously (don't await)
+    executeScanJob(nextJob, orchestrator, abortController);
+  }
+}
+
+// Queue cleanup — remove completed/errored jobs older than 1 hour every 10 minutes
+setInterval(() => {
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  let removed = 0;
+  while (
+    scanQueue.length > 0 &&
+    (scanQueue[0].status === 'completed' || scanQueue[0].status === 'error') &&
+    new Date(scanQueue[0].completedAt || scanQueue[0].queuedAt).getTime() < oneHourAgo
+  ) {
+    scanQueue.shift();
+    removed++;
+  }
+  if (removed > 0) {
+    logger.info(`Queue cleanup: removed ${removed} old entries`);
+  }
+}, 10 * 60 * 1000);
+
 const JWT_SECRET = process.env.JWT_SECRET || 'vzy-dashboard-secret-key-2026';
 const JWT_EXPIRES_IN = '24h';
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
@@ -390,8 +627,9 @@ app.get('/api/trends', async (req, res) => {
   res.json(trend);
 });
 
-// Trigger manual scan
+// Trigger manual scan (goes through the queue)
 app.post('/api/scans', authMiddleware, requireRole('admin', 'devops') as any, async (req: Request, res: Response) => {
+  const authReq = req as AuthRequest;
   const { url, repoPath, agents, platform } = req.body;
 
   if (!url && !repoPath) {
@@ -399,40 +637,38 @@ app.post('/api/scans', authMiddleware, requireRole('admin', 'devops') as any, as
   }
 
   const config = Orchestrator.createConfig({ url, repoPath, agents, platform, thresholds: systemConfig.thresholds });
-  res.json({ status: 'queued', scanId: config.id });
 
-  // Run scan in background with abort support
-  const orchestrator = new Orchestrator();
-  const abortController = new AbortController();
-  runningScans.set(config.id, { orchestrator, abortController });
+  const job: QueuedScanJob = {
+    jobId: `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    scanId: config.id,
+    type: 'single',
+    url: url || repoPath || '',
+    config,
+    userEmail: authReq.user!.email,
+    userName: authReq.user!.name,
+    userId: authReq.user!.id,
+    status: 'queued',
+    queuedAt: new Date().toISOString(),
+  };
 
-  try {
-    const report = await orchestrator.runScan(config);
+  scanQueue.push(job);
+  const position = scanQueue.filter(j => j.status === 'queued').length;
+  logger.info(`Scan queued by ${authReq.user!.email}: ${job.url} (position: ${position})`);
 
-    // Only emit if not aborted
-    if (!abortController.signal.aborted) {
-      io.emit('scan:complete', {
-        scanId: config.id,
-        score: report.kpiScore.overallScore,
-        status: report.kpiScore.passesThreshold ? 'pass' : 'fail',
-      });
-    }
-  } catch (error) {
-    if (abortController.signal.aborted) {
-      io.emit('scan:error', { scanId: config.id, error: 'Scan aborted by user' });
-    } else {
-      io.emit('scan:error', { scanId: config.id, error: String(error) });
-    }
-  } finally {
-    runningScans.delete(config.id);
-  }
+  res.json({
+    status: activeJobs.size < MAX_CONCURRENT_SCANS ? 'started' : 'queued',
+    scanId: config.id,
+    jobId: job.jobId,
+    queuePosition: position,
+  });
+
+  // Trigger queue processor
+  processQueue();
 });
 
-// Batch scan — run multiple URLs with parallel execution
-// Concurrency lock prevents double-clicking from creating duplicate batches
-let activeBatchId: string | null = null;
-
+// Batch scan — decompose into individual queue entries (queue handles concurrency)
 app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as any, async (req: Request, res: Response) => {
+  const authReq = req as AuthRequest;
   const { urls, agents, platform } = req.body;
 
   if (!urls || !Array.isArray(urls) || urls.length === 0) {
@@ -443,135 +679,62 @@ app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as a
     return res.status(400).json({ error: 'Maximum 20 URLs per batch' });
   }
 
-  // ── Concurrency lock: prevent multiple batch scans from interleaving ──
-  if (activeBatchId) {
-    return res.status(409).json({
-      error: 'A batch scan is already in progress',
-      activeBatchId,
-      hint: 'Wait for the current batch to complete or abort it',
-    });
-  }
-
   const batchId = `batch_${Date.now()}`;
-  activeBatchId = batchId;
 
   // De-duplicate and trim URLs
   const uniqueUrls = [...new Set(urls.map((u: string) => u.trim()).filter(Boolean))];
 
-  // Create configs lazily per URL (avoid sharing state between configs)
   const scanEntries = uniqueUrls.map((url: string) => {
     const config = Orchestrator.createConfig({ url, agents, platform, thresholds: systemConfig.thresholds });
-    return { url, scanId: config.id, config, status: 'queued' as string };
+    const job: QueuedScanJob = {
+      jobId: `job_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      scanId: config.id,
+      type: 'batch-entry',
+      batchId,
+      url,
+      config,
+      userEmail: authReq.user!.email,
+      userName: authReq.user!.name,
+      userId: authReq.user!.id,
+      status: 'queued',
+      queuedAt: new Date().toISOString(),
+    };
+    scanQueue.push(job);
+    return { url, scanId: config.id, status: 'queued' };
   });
 
-  // Return immediately with batch info
+  logger.info(`Batch ${batchId} queued by ${authReq.user!.email}: ${uniqueUrls.length} URLs`);
+
   res.json({
     batchId,
     total: scanEntries.length,
-    scans: scanEntries.map((s) => ({ url: s.url, scanId: s.scanId, status: 'queued' })),
+    scans: scanEntries,
   });
 
-  // Emit batch start
-  io.emit('batch:start', { batchId, total: scanEntries.length });
-
-  const BATCH_SCAN_TIMEOUT = 360_000; // 6 minutes per URL
-  const BATCH_CONCURRENCY = 2;        // Run 2 scans in parallel (safe for 4 vCPU / 8GB RAM)
-
-  let completedCount = 0;
-
-  // Helper: run a single scan with timeout and error isolation
-  const runOneScan = async (entry: typeof scanEntries[0], index: number) => {
-    logger.info(`[Batch ${batchId}] Starting scan ${index + 1}/${scanEntries.length}: ${entry.url}`);
-
-    const orchestrator = new Orchestrator();
-    const abortController = new AbortController();
-    runningScans.set(entry.scanId, { orchestrator, abortController });
-
-    io.emit('batch:progress', {
-      batchId,
-      current: index + 1,
-      total: scanEntries.length,
-      scanId: entry.scanId,
-      url: entry.url,
-      status: 'running',
-    });
-
-    try {
-      const report = await Promise.race([
-        orchestrator.runScan(entry.config),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`Batch scan timeout after ${BATCH_SCAN_TIMEOUT / 1000}s for ${entry.url}`)), BATCH_SCAN_TIMEOUT),
-        ),
-      ]);
-
-      completedCount++;
-      if (!abortController.signal.aborted) {
-        io.emit('scan:complete', {
-          scanId: entry.scanId,
-          url: entry.url,
-          score: report.kpiScore.overallScore,
-          status: report.kpiScore.passesThreshold ? 'pass' : 'fail',
-          batchId,
-        });
-        io.emit('batch:progress', {
-          batchId,
-          current: completedCount,
-          total: scanEntries.length,
-          scanId: entry.scanId,
-          url: entry.url,
-          status: 'completed',
-          score: report.kpiScore.overallScore,
-        });
-        logger.info(`[Batch ${batchId}] Scan ${index + 1} completed: ${entry.url} → ${report.kpiScore.overallScore}`);
-      }
-    } catch (error) {
-      completedCount++;
-      const errMsg = error instanceof Error ? error.message : String(error);
-      logger.error(`[Batch ${batchId}] Scan ${index + 1} failed: ${entry.url}`, { error: errMsg });
-
-      io.emit('scan:error', { scanId: entry.scanId, url: entry.url, error: errMsg, batchId });
-      io.emit('batch:progress', {
-        batchId,
-        current: completedCount,
-        total: scanEntries.length,
-        scanId: entry.scanId,
-        url: entry.url,
-        status: 'error',
-        error: errMsg,
-      });
-    } finally {
-      runningScans.delete(entry.scanId);
-    }
-  };
-
-  // ── Process in parallel batches of BATCH_CONCURRENCY ──
-  try {
-    for (let i = 0; i < scanEntries.length; i += BATCH_CONCURRENCY) {
-      const chunk = scanEntries.slice(i, i + BATCH_CONCURRENCY);
-      await Promise.allSettled(chunk.map((entry, j) => runOneScan(entry, i + j)));
-
-      // Brief pause between parallel chunks for resource cleanup
-      if (i + BATCH_CONCURRENCY < scanEntries.length) {
-        await new Promise((resolve) => setTimeout(resolve, 2_000));
-      }
-    }
-  } finally {
-    // Always release the batch lock
-    if (activeBatchId === batchId) {
-      activeBatchId = null;
-    }
-  }
-
-  // Emit batch complete
-  io.emit('batch:complete', { batchId, total: scanEntries.length });
-  logger.info(`Batch scan completed: ${batchId} (${scanEntries.length} URLs)`);
+  io.emit('batch:start', { batchId, total: scanEntries.length, userEmail: authReq.user!.email, userName: authReq.user!.name });
+  processQueue();
 });
 
-// Abort a running scan
+// Abort a running or queued scan
 app.post('/api/scans/:scanId/abort', authMiddleware, requireRole('admin', 'devops') as any, async (req: AuthRequest, res: Response) => {
   const { scanId } = req.params;
-  const running = runningScans.get(scanId);
 
+  // Check if it's a queued (not yet running) scan — just remove from queue
+  const queuedIdx = scanQueue.findIndex(j => j.scanId === scanId && j.status === 'queued');
+  if (queuedIdx !== -1) {
+    const job = scanQueue[queuedIdx];
+    job.status = 'error';
+    job.error = 'Scan aborted by user';
+    job.completedAt = new Date().toISOString();
+    io.emit('scan:error', { scanId, url: job.url, error: 'Scan aborted by user', batchId: job.batchId });
+    broadcastQueueStatus();
+    if (job.batchId) checkBatchComplete(job.batchId);
+    logger.info(`Queued scan aborted by ${req.user!.email}: ${scanId}`);
+    return res.json({ message: 'Queued scan aborted', scanId });
+  }
+
+  // Check if it's a running scan
+  const running = runningScans.get(scanId);
   if (!running) {
     return res.status(404).json({ error: 'Scan not found or already completed' });
   }
@@ -594,6 +757,32 @@ app.post('/api/scans/:scanId/abort', authMiddleware, requireRole('admin', 'devop
     logger.error('Failed to abort scan', { error: String(error), scanId });
     res.status(500).json({ error: 'Failed to abort scan' });
   }
+});
+
+// Get current queue status (REST endpoint for initial page load)
+app.get('/api/scans/queue', authMiddleware as any, async (_req: AuthRequest, res: Response) => {
+  res.json({
+    activeScans: Array.from(activeJobs.values()).map(({ job }) => ({
+      scanId: job.scanId,
+      url: job.url,
+      userEmail: job.userEmail,
+      userName: job.userName,
+      startedAt: job.startedAt,
+      batchId: job.batchId,
+    })),
+    queuedScans: scanQueue.filter(j => j.status === 'queued').map(j => ({
+      jobId: j.jobId,
+      scanId: j.scanId,
+      url: j.url,
+      userEmail: j.userEmail,
+      userName: j.userName,
+      queuedAt: j.queuedAt,
+      batchId: j.batchId,
+    })),
+    maxConcurrent: MAX_CONCURRENT_SCANS,
+    activeCount: activeJobs.size,
+    queueLength: scanQueue.filter(j => j.status === 'queued').length,
+  });
 });
 
 // ============================= REPORT ENDPOINTS ==============================
@@ -1344,6 +1533,23 @@ app.get('/api/health', (_req, res) => {
 // ============================= WEBSOCKET ===================================
 io.on('connection', (socket) => {
   logger.info(`Dashboard client connected: ${socket.id}`);
+
+  // Join a user-specific room for targeted notifications
+  const token = socket.handshake.auth?.token;
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET) as { id: string; email: string };
+      socket.join(`user:${decoded.id}`);
+      (socket as any).data = { userId: decoded.id, userEmail: decoded.email };
+      logger.info(`Socket ${socket.id} joined room user:${decoded.id} (${decoded.email})`);
+    } catch {
+      // Token invalid; still allow connection for public broadcasts
+    }
+  }
+
+  // Send current queue status to newly connected client
+  broadcastQueueStatus();
+
   socket.on('disconnect', () => {
     logger.info(`Dashboard client disconnected: ${socket.id}`);
   });

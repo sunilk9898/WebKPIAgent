@@ -58,7 +58,18 @@ export abstract class BaseAgent {
       }
     } finally {
       this.completedAt = new Date();
-      await this.teardown();
+      // Teardown with a timeout guard — if Chrome.kill() hangs, don't block forever
+      try {
+        await Promise.race([
+          this.teardown(),
+          new Promise<void>((resolve) => setTimeout(() => {
+            this.logger.warn(`${this.agentType} teardown timed out after 10s, continuing`);
+            resolve();
+          }, 10_000)),
+        ]);
+      } catch (teardownErr) {
+        this.logger.error(`${this.agentType} teardown error (non-fatal)`, { error: String(teardownErr) });
+      }
     }
 
     const result = this.buildResult(config);

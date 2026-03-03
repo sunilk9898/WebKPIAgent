@@ -28,12 +28,44 @@ export interface WSBatchComplete {
   total: number;
 }
 
+// Queue event types
+export interface WSQueueStatus {
+  activeScans: {
+    scanId: string;
+    url: string;
+    userEmail: string;
+    userName: string;
+    startedAt: string;
+    batchId?: string;
+  }[];
+  queuedScans: {
+    jobId: string;
+    scanId: string;
+    url: string;
+    userEmail: string;
+    userName: string;
+    queuedAt: string;
+    batchId?: string;
+  }[];
+  maxConcurrent: number;
+  activeCount: number;
+  queueLength: number;
+}
+
+export interface WSScanStarted {
+  scanId: string;
+  jobId: string;
+  url: string;
+}
+
 const listeners = {
   "scan:progress": new Set<Listener<WSScanProgress>>(),
   "scan:complete": new Set<Listener<WSScanComplete>>(),
   "scan:error": new Set<Listener<WSScanError>>(),
   "batch:progress": new Set<Listener<WSBatchProgress>>(),
   "batch:complete": new Set<Listener<WSBatchComplete>>(),
+  "queue:status": new Set<Listener<WSQueueStatus>>(),
+  "scan:started": new Set<Listener<WSScanStarted>>(),
 };
 
 // ---------------------------------------------------------------------------
@@ -80,6 +112,15 @@ export function connect(): Socket {
 
   socket.on("batch:complete", (data: WSBatchComplete) => {
     listeners["batch:complete"].forEach((fn) => fn(data));
+  });
+
+  // Queue events
+  socket.on("queue:status", (data: WSQueueStatus) => {
+    listeners["queue:status"].forEach((fn) => fn(data));
+  });
+
+  socket.on("scan:started", (data: WSScanStarted) => {
+    listeners["scan:started"].forEach((fn) => fn(data));
   });
 
   return socket;
@@ -129,5 +170,19 @@ export function onBatchComplete(fn: Listener<WSBatchComplete>): () => void {
   listeners["batch:complete"].add(fn);
   return () => {
     listeners["batch:complete"].delete(fn);
+  };
+}
+
+export function onQueueStatus(fn: Listener<WSQueueStatus>): () => void {
+  listeners["queue:status"].add(fn);
+  return () => {
+    listeners["queue:status"].delete(fn);
+  };
+}
+
+export function onScanStarted(fn: Listener<WSScanStarted>): () => void {
+  listeners["scan:started"].add(fn);
+  return () => {
+    listeners["scan:started"].delete(fn);
   };
 }

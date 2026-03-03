@@ -94,8 +94,10 @@ export interface ScanRequest {
 }
 
 export interface ScanResponse {
-  status: "accepted" | "queued";
+  status: "accepted" | "queued" | "started";
   scanId: string;
+  jobId?: string;
+  queuePosition?: number;
 }
 
 export async function triggerScan(body: ScanRequest): Promise<ScanResponse> {
@@ -126,6 +128,36 @@ export async function abortScan(scanId: string): Promise<{ message: string; scan
   return request<{ message: string; scanId: string }>(`/scans/${scanId}/abort`, {
     method: "POST",
   });
+}
+
+// ---------------------------------------------------------------------------
+// Scan Queue
+// ---------------------------------------------------------------------------
+export interface QueueStatusResponse {
+  activeScans: {
+    scanId: string;
+    url: string;
+    userEmail: string;
+    userName: string;
+    startedAt: string;
+    batchId?: string;
+  }[];
+  queuedScans: {
+    jobId: string;
+    scanId: string;
+    url: string;
+    userEmail: string;
+    userName: string;
+    queuedAt: string;
+    batchId?: string;
+  }[];
+  maxConcurrent: number;
+  activeCount: number;
+  queueLength: number;
+}
+
+export async function getQueueStatus(): Promise<QueueStatusResponse> {
+  return request<QueueStatusResponse>("/scans/queue");
 }
 
 // ---------------------------------------------------------------------------

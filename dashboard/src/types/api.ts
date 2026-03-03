@@ -191,9 +191,10 @@ export interface AuthState {
 // -- WebSocket Events --
 export interface WSScanProgress {
   scanId: string;
-  agent: AgentType;
+  agent: AgentType | string;  // Can be "all" for overall progress
   progress: number;       // 0-100
   status: ScanStatus;
+  phase?: string;         // e.g. "agents", "report", "complete"
 }
 
 export interface WSScanComplete {

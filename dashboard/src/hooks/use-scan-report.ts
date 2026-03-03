@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useCallback } from "react";
-import { useReportStore, useScanStore } from "@/lib/store";
+import { useReportStore, useScanStore, useToastStore } from "@/lib/store";
 import { getLatestReport, triggerScan, type ScanRequest } from "@/lib/api";
 import { onScanComplete, onScanError, onScanProgress } from "@/lib/websocket";
 import type { ScanReport, AgentResult } from "@/types/api";
@@ -34,9 +34,20 @@ export function useScanReport() {
     setLoading(true);
     try {
       const res = await triggerScan(req);
+
+      // Show queued notification if not started immediately
+      if (res.queuePosition && res.queuePosition > 0 && res.status === 'queued') {
+        useToastStore.getState().addToast({
+          type: "warning",
+          title: "Scan Queued",
+          message: `All scan slots are busy. Your scan is #${res.queuePosition} in the queue.`,
+          duration: 6000,
+        });
+      }
+
       setActiveScan({
         scanId: res.scanId,
-        status: "running",
+        status: res.status === 'queued' ? 'queued' : "running",
         agents: {
           security: { progress: 0, status: "queued" },
           performance: { progress: 0, status: "queued" },

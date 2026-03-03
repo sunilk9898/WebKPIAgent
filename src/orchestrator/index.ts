@@ -27,13 +27,27 @@ import {
   ScanTarget, Platform, ScoreThresholds, NotificationConfig,
 } from '../types';
 
-const AGENT_TIMEOUT_MS = 300_000;  // 5 minutes per agent
+const AGENT_TIMEOUT_MS = 240_000;  // 4 minutes per agent (reduced from 5m — LH retries reduced)
+
+export type ScanProgressCallback = (phase: string, agentType: string, progress: number, status: string) => void;
 
 export class Orchestrator {
   private logger = new Logger('orchestrator');
   private reportGenerator = new ReportGenerator();
   private notificationService = new NotificationService();
   private resultStore = new ResultStore();
+  private progressCallback?: ScanProgressCallback;
+
+  /** Set a callback to receive real-time scan progress updates */
+  onProgress(cb: ScanProgressCallback): void {
+    this.progressCallback = cb;
+  }
+
+  private emitProgress(phase: string, agentType: string, progress: number, status: string): void {
+    if (this.progressCallback) {
+      try { this.progressCallback(phase, agentType, progress, status); } catch { /* non-critical */ }
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Main Entry Point
@@ -51,22 +65,27 @@ export class Orchestrator {
     // 1. Initialize agents
     const agents = this.initializeAgents(config.agents);
     this.logger.info(`Initialized ${agents.length} agent(s)`);
+    this.emitProgress('agents', 'all', 10, 'running');
 
     // 2. Execute all agents concurrently
     const agentResults = await this.executeAgentsConcurrently(agents, config);
     this.logger.info(`All agents completed in ${Date.now() - startTime}ms`);
+    this.emitProgress('agents', 'all', 70, 'completed');
 
     // 3. Generate report with AI reasoning
+    this.emitProgress('report', 'report-generator', 75, 'running');
     const previousReport = await this.resultStore.getLatestReport(
       config.target.url || config.target.repoPath || '',
     );
     const report = await this.reportGenerator.generate(config, agentResults, previousReport || undefined);
+    this.emitProgress('report', 'report-generator', 90, 'completed');
 
     // 4. Store results
     await this.resultStore.saveReport(report);
 
     // 5. Send notifications
     await this.notificationService.notify(report, config.notifications);
+    this.emitProgress('complete', 'all', 100, 'completed');
 
     // 6. Log summary
     this.logSummary(report, Date.now() - startTime);
@@ -128,12 +147,17 @@ export class Orchestrator {
     config: ScanConfig,
   ): Promise<AgentResult[]> {
     const results = await Promise.allSettled(
-      agents.map((agent) =>
-        Promise.race([
-          agent.execute(config),
+      agents.map((agent, idx) => {
+        const agentType = config.agents[idx];
+        this.emitProgress('agents', agentType, 15 + idx * 5, 'running');
+        return Promise.race([
+          agent.execute(config).then((r) => {
+            this.emitProgress('agents', agentType, 50 + idx * 8, 'completed');
+            return r;
+          }),
           this.timeoutGuard(agent.constructor.name),
-        ]),
-      ),
+        ]);
+      }),
     );
 
     return results.map((result, index) => {
