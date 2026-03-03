@@ -20,7 +20,7 @@ import { getTrends, triggerBatchScan, triggerScan, getLatestReport, abortScan, t
 import { AIRecommendationsPanel } from "@/components/panels/ai-recommendations-panel";
 import { ExecutiveSummary } from "@/components/shared/executive-summary";
 import { cn, timeAgo, getScoreStatus } from "@/lib/utils";
-import { useUIStore, useBatchStore, useReportStore, useScanStore, useAuthStore, type BatchScanEntry } from "@/lib/store";
+import { useUIStore, useBatchStore, useReportStore, useScanStore, useAuthStore, useToastStore, type BatchScanEntry } from "@/lib/store";
 import { onBatchProgress, onBatchComplete, onScanProgress } from "@/lib/websocket";
 
 export default function OverviewPage() {
@@ -457,18 +457,22 @@ function BatchProgressPanel({
   const { restartBatchEntry } = useBatchStore();
   const [actionLoading, setActionLoading] = useState<Record<string, "cancel" | "restart" | null>>({});
 
+  const addToast = useToastStore((s) => s.addToast);
+
   const handleCancel = async (e: React.MouseEvent, scanId: string) => {
     e.stopPropagation();
     if (actionLoading[scanId]) return;
     setActionLoading((prev) => ({ ...prev, [scanId]: "cancel" }));
     try {
       await abortScan(scanId);
-      useBatchStore.getState().updateBatchEntry(scanId, { status: "error", error: "Cancelled by admin" });
     } catch (err: any) {
-      console.warn("Cancel failed:", err.message);
-    } finally {
-      setActionLoading((prev) => ({ ...prev, [scanId]: null }));
+      // Even if API fails (e.g., scan not found after restart), still update UI
+      console.warn("Cancel API returned error (updating UI anyway):", err.message);
     }
+    // Always update UI — whether API succeeded or scan was already dead
+    useBatchStore.getState().updateBatchEntry(scanId, { status: "error", error: "Cancelled" });
+    addToast({ type: "info", title: "Scan Cancelled", duration: 3000 });
+    setActionLoading((prev) => ({ ...prev, [scanId]: null }));
   };
 
   const handleRestart = async (e: React.MouseEvent, scan: BatchScanEntry) => {
@@ -478,8 +482,9 @@ function BatchProgressPanel({
     try {
       const res = await triggerScan({ url: scan.url, platform: "both", agents: ["security", "performance", "code-quality"] });
       restartBatchEntry(scan.scanId, res.scanId);
+      addToast({ type: "success", title: "Scan Restarted", message: `Re-scanning ${scan.url}`, duration: 4000 });
     } catch (err: any) {
-      console.warn("Restart failed:", err.message);
+      addToast({ type: "error", title: "Restart Failed", message: err.message, duration: 5000 });
     } finally {
       setActionLoading((prev) => ({ ...prev, [scan.scanId]: null }));
     }
