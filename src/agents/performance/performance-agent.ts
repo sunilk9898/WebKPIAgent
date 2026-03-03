@@ -164,10 +164,13 @@ export class PerformanceAgent extends BaseAgent {
 
   // ── Metric collectors for metadata (per-platform to avoid overwrite) ──
   private _lhScoresMap: Record<string, { performance: number; accessibility: number; bestPractices: number; seo: number; pwa: number }> = {};
+  private _lhAuditMetrics: Record<string, { si: number; tbt: number }> = {}; // Speed Index & TBT from LH audits
   private _cwvValuesMap: Record<string, Record<string, { value: number; rating: 'good' | 'needs-improvement' | 'poor' }>> = {};
   private _playerMetrics: Record<string, number> = {};
-  private _resourceData: { totalSize: number; jsSize: number; cssSize: number; imageSize: number; fontSize: number; thirdPartySize: number; requestCount: number; renderBlocking: string[] } | null = null;
+  private _resourceData: { totalSize: number; jsSize: number; cssSize: number; imageSize: number; fontSize: number; thirdPartySize: number; requestCount: number; renderBlocking: string[]; uncompressedAssets: string[] } | null = null;
   private _cdnStats: { hits: number; total: number; latencies: number[]; compressed: number; uncompressed: number } = { hits: 0, total: 0, latencies: [], compressed: 0, uncompressed: 0 };
+  private _cdnEdgeLocations: Set<string> = new Set();
+  private _cdnHasCacheHeaders = false;
 
   // Track CDN issues by type (grouped) instead of per-asset
   private _cdnIssues: { missingCache: string[]; uncompressed: string[] } = { missingCache: [], uncompressed: [] };
@@ -455,7 +458,12 @@ export class PerformanceAgent extends BaseAgent {
       pwa: Math.round((finalLhr.categories.pwa?.score || 0) * 100),
     };
 
-    this.logger.info(`Lighthouse ${platform} (median of ${runResults.length}): Performance=${finalScore}, Accessibility=${this._lhScoresMap[platform].accessibility}, BestPractices=${this._lhScoresMap[platform].bestPractices}, SEO=${this._lhScoresMap[platform].seo}, PWA=${this._lhScoresMap[platform].pwa}`);
+    // Extract Speed Index and TBT from the median Lighthouse run audits
+    const siValue = Math.round(finalLhr.audits?.['speed-index']?.numericValue || 0);
+    const tbtValue = Math.round(finalLhr.audits?.['total-blocking-time']?.numericValue || 0);
+    this._lhAuditMetrics[platform] = { si: siValue, tbt: tbtValue };
+
+    this.logger.info(`Lighthouse ${platform} (median of ${runResults.length}): Performance=${finalScore}, Accessibility=${this._lhScoresMap[platform].accessibility}, BestPractices=${this._lhScoresMap[platform].bestPractices}, SEO=${this._lhScoresMap[platform].seo}, PWA=${this._lhScoresMap[platform].pwa}, SI=${siValue}ms, TBT=${tbtValue}ms`);
 
     // Check against target
     if (finalScore < THRESHOLDS.lighthouseScore) {
@@ -541,9 +549,9 @@ export class PerformanceAgent extends BaseAgent {
         await page.setViewport({ width: 1350, height: 940, deviceScaleFactor: 1 });
       }
 
-      // Inject web-vitals measurement
+      // Inject web-vitals measurement (including INP via event timing)
       await page.evaluateOnNewDocument(() => {
-        (window as any).__webVitals = {};
+        (window as any).__webVitals = { _inpEntries: [] as number[] };
         const observer = new PerformanceObserver((list) => {
           for (const entry of list.getEntries()) {
             if (entry.entryType === 'largest-contentful-paint') {
@@ -555,11 +563,20 @@ export class PerformanceAgent extends BaseAgent {
             if (entry.entryType === 'layout-shift' && !(entry as any).hadRecentInput) {
               (window as any).__webVitals.cls = ((window as any).__webVitals.cls || 0) + (entry as any).value;
             }
+            // INP: collect all event interaction durations; INP = p98 of durations
+            if (entry.entryType === 'event') {
+              const duration = (entry as any).duration;
+              if (duration > 0) {
+                (window as any).__webVitals._inpEntries.push(duration);
+              }
+            }
           }
         });
         observer.observe({ type: 'largest-contentful-paint', buffered: true });
         observer.observe({ type: 'first-input', buffered: true });
         observer.observe({ type: 'layout-shift', buffered: true });
+        // INP requires 'event' entry type with durationThreshold
+        try { observer.observe({ type: 'event', buffered: true, durationThreshold: 16 } as any); } catch {}
       });
 
       const startTime = Date.now();
@@ -577,8 +594,20 @@ export class PerformanceAgent extends BaseAgent {
         };
       });
 
-      // Collect web vitals
-      const webVitals = await page.evaluate(() => (window as any).__webVitals || {});
+      // Collect web vitals (including INP computation from event timing entries)
+      const webVitals = await page.evaluate(() => {
+        const wv = (window as any).__webVitals || {};
+        // Compute INP: p98 of interaction durations (per web.dev INP spec)
+        const inpEntries: number[] = wv._inpEntries || [];
+        if (inpEntries.length > 0) {
+          inpEntries.sort((a: number, b: number) => a - b);
+          const p98Index = Math.min(Math.ceil(inpEntries.length * 0.98) - 1, inpEntries.length - 1);
+          wv.inp = inpEntries[p98Index];
+        } else {
+          wv.inp = 0;
+        }
+        return wv;
+      });
 
       // Assess each metric
       const metrics: { name: string; value: number; threshold: number; unit: string }[] = [
@@ -587,6 +616,7 @@ export class PerformanceAgent extends BaseAgent {
         { name: 'CLS', value: webVitals.cls || 0, threshold: THRESHOLDS.cls, unit: '' },
         { name: 'FID', value: webVitals.fid || 0, threshold: THRESHOLDS.fid, unit: 'ms' },
         { name: 'TTFB', value: ttfb, threshold: THRESHOLDS.ttfb, unit: 'ms' },
+        { name: 'INP', value: webVitals.inp || 0, threshold: THRESHOLDS.inp, unit: 'ms' },
       ];
 
       // Store CWV values for metadata
@@ -599,7 +629,7 @@ export class PerformanceAgent extends BaseAgent {
         cls: { value: webVitals.cls || 0, rating: rateMetric(webVitals.cls || 0, 0.1, 0.25) },
         fid: { value: webVitals.fid || 0, rating: rateMetric(webVitals.fid || 0, 100, 300) },
         ttfb: { value: ttfb, rating: rateMetric(ttfb, 800, 1800) },
-        inp: { value: 0, rating: 'good' as const },
+        inp: { value: webVitals.inp || 0, rating: rateMetric(webVitals.inp || 0, 200, 500) },
       };
 
       for (const metric of metrics) {
@@ -783,6 +813,34 @@ export class PerformanceAgent extends BaseAgent {
           this._cdnStats.total++;
           if (cdnHeaders.toLowerCase().includes('hit')) this._cdnStats.hits++;
 
+          // Track latency from response timing
+          const timing = response.timing();
+          if (timing) {
+            const responseTime = timing.receiveHeadersEnd;
+            if (responseTime > 0) this._cdnStats.latencies.push(responseTime);
+          }
+
+          // Detect edge locations from CDN headers
+          const edgeHeaders = [
+            headers['x-served-by'],       // Fastly/Varnish
+            headers['cf-ray'],            // Cloudflare (e.g., "7abcdef-SIN")
+            headers['x-amz-cf-pop'],      // CloudFront (e.g., "SIN52-C1")
+            headers['x-cache-hits'],      // Varnish
+            headers['x-cdn-pop'],         // Generic CDN
+          ].filter(Boolean);
+          for (const h of edgeHeaders) {
+            if (h) {
+              // Extract location code from header values (e.g., "SIN52-C1" → "SIN52")
+              const loc = h.split(',')[0].split('-')[0].trim();
+              if (loc.length >= 3 && loc.length <= 10) this._cdnEdgeLocations.add(loc);
+            }
+          }
+
+          // Track cache header presence
+          if (cacheControl && !cacheControl.includes('no-cache') && !cacheControl.includes('no-store')) {
+            this._cdnHasCacheHeaders = true;
+          }
+
           // Collect issues for grouped findings (instead of per-asset)
           if (!cacheControl || cacheControl.includes('no-cache') || cacheControl.includes('no-store')) {
             this._cdnIssues.missingCache.push(new URL(resUrl).pathname.split('/').pop() || resUrl);
@@ -882,6 +940,13 @@ export class PerformanceAgent extends BaseAgent {
       const imgSize = resources.filter((r) => r.type.includes('image')).reduce((sum, r) => sum + r.size, 0);
       const fontSize = resources.filter((r) => r.type.includes('font') || r.url.match(/\.(woff2?|ttf|otf|eot)$/i)).reduce((sum, r) => sum + r.size, 0);
 
+      // Calculate third-party size (resources from different origins than the page)
+      let pageOrigin = '';
+      try { pageOrigin = new URL(url).origin; } catch {}
+      const thirdPartySize = resources
+        .filter((r) => { try { return new URL(r.url).origin !== pageOrigin; } catch { return false; } })
+        .reduce((sum, r) => sum + r.size, 0);
+
       // Total page weight check
       if (totalSize > 5_000_000) { // 5MB
         this.addFinding({
@@ -920,9 +985,10 @@ export class PerformanceAgent extends BaseAgent {
         cssSize,
         imageSize: imgSize,
         fontSize,
-        thirdPartySize: 0,
+        thirdPartySize,
         requestCount: resources.length,
         renderBlocking,
+        uncompressedAssets: this._cdnIssues.uncompressed.slice(0, 20),
       };
 
       if (renderBlocking.length > 3) {
@@ -982,8 +1048,20 @@ export class PerformanceAgent extends BaseAgent {
 
     // ── Core Web Vitals ──
     // Use desktop CWV as primary; fall back to mobile
+    const rateMetric = (val: number, good: number, poor: number): 'good' | 'needs-improvement' | 'poor' =>
+      val <= good ? 'good' : val <= poor ? 'needs-improvement' : 'poor';
     const primaryCWV = this._cwvValuesMap['desktop'] || this._cwvValuesMap['mweb'] || null;
-    const coreWebVitals = primaryCWV || null;
+    // Enrich CWV with SI and TBT from Lighthouse audits (if available)
+    const primaryLHAudit = this._lhAuditMetrics['desktop'] || this._lhAuditMetrics['mweb'] || null;
+    const coreWebVitals = primaryCWV
+      ? {
+          ...primaryCWV,
+          ...(primaryLHAudit ? {
+            si: { value: primaryLHAudit.si, rating: rateMetric(primaryLHAudit.si, 3400, 5800) },
+            tbt: { value: primaryLHAudit.tbt, rating: rateMetric(primaryLHAudit.tbt, 200, 600) },
+          } : {}),
+        }
+      : null;
 
     // ── Player Metrics ──
     const hasPlayer = this._playerMetrics && Object.keys(this._playerMetrics).length > 0;
@@ -1002,10 +1080,15 @@ export class PerformanceAgent extends BaseAgent {
 
     // ── CDN Metrics ──
     const cdnTotal = this._cdnStats.total || 1;
+    const latencies = this._cdnStats.latencies.filter(l => l > 0).sort((a, b) => a - b);
+    const avgLatency = latencies.length > 0 ? Math.round(latencies.reduce((s, l) => s + l, 0) / latencies.length) : 0;
+    const p95Latency = latencies.length > 0 ? Math.round(latencies[Math.min(Math.ceil(latencies.length * 0.95) - 1, latencies.length - 1)]) : 0;
     const cdnMetrics = {
       hitRatio: this._cdnStats.total > 0 ? this._cdnStats.hits / cdnTotal : 0,
-      avgLatency: 0,
-      p95Latency: 0,
+      avgLatency,
+      p95Latency,
+      edgeLocations: Array.from(this._cdnEdgeLocations),
+      cacheHeaders: this._cdnHasCacheHeaders,
       compressionEnabled: this._cdnStats.compressed > this._cdnStats.uncompressed,
     };
 
@@ -1019,6 +1102,7 @@ export class PerformanceAgent extends BaseAgent {
           fontSize: this._resourceData.fontSize,
           thirdPartySize: this._resourceData.thirdPartySize,
           requestCount: this._resourceData.requestCount,
+          uncompressedAssets: this._resourceData.uncompressedAssets || [],
           renderBlockingResources: this._resourceData.renderBlocking,
         }
       : null;

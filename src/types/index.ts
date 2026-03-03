@@ -260,6 +260,8 @@ export interface CoreWebVitals {
   fid: { value: number; rating: 'good' | 'needs-improvement' | 'poor' };
   ttfb: { value: number; rating: 'good' | 'needs-improvement' | 'poor' };
   inp: { value: number; rating: 'good' | 'needs-improvement' | 'poor' };
+  si?: { value: number; rating: 'good' | 'needs-improvement' | 'poor' };   // Speed Index (from Lighthouse audit)
+  tbt?: { value: number; rating: 'good' | 'needs-improvement' | 'poor' };  // Total Blocking Time (from Lighthouse audit)
 }
 
 export interface PlayerMetrics {
