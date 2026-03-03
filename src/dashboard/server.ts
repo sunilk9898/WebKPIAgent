@@ -428,7 +428,10 @@ app.post('/api/scans', authMiddleware, requireRole('admin', 'devops') as any, as
   }
 });
 
-// Batch scan — run multiple URLs sequentially
+// Batch scan — run multiple URLs with parallel execution
+// Concurrency lock prevents double-clicking from creating duplicate batches
+let activeBatchId: string | null = null;
+
 app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as any, async (req: Request, res: Response) => {
   const { urls, agents, platform } = req.body;
 
@@ -440,7 +443,17 @@ app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as a
     return res.status(400).json({ error: 'Maximum 20 URLs per batch' });
   }
 
+  // ── Concurrency lock: prevent multiple batch scans from interleaving ──
+  if (activeBatchId) {
+    return res.status(409).json({
+      error: 'A batch scan is already in progress',
+      activeBatchId,
+      hint: 'Wait for the current batch to complete or abort it',
+    });
+  }
+
   const batchId = `batch_${Date.now()}`;
+  activeBatchId = batchId;
 
   // De-duplicate and trim URLs
   const uniqueUrls = [...new Set(urls.map((u: string) => u.trim()).filter(Boolean))];
@@ -461,19 +474,14 @@ app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as a
   // Emit batch start
   io.emit('batch:start', { batchId, total: scanEntries.length });
 
-  const BATCH_SCAN_TIMEOUT = 360_000; // 6 minutes per URL (slightly more than agent timeout)
-  const INTER_SCAN_DELAY = 3_000;     // 3 seconds between scans for cleanup
+  const BATCH_SCAN_TIMEOUT = 360_000; // 6 minutes per URL
+  const BATCH_CONCURRENCY = 2;        // Run 2 scans in parallel (safe for 4 vCPU / 8GB RAM)
 
-  // Process sequentially with robust error isolation
-  for (let i = 0; i < scanEntries.length; i++) {
-    const entry = scanEntries[i];
+  let completedCount = 0;
 
-    // Inter-scan delay to allow previous browser/resource cleanup
-    if (i > 0) {
-      await new Promise((resolve) => setTimeout(resolve, INTER_SCAN_DELAY));
-    }
-
-    logger.info(`[Batch ${batchId}] Starting scan ${i + 1}/${scanEntries.length}: ${entry.url}`);
+  // Helper: run a single scan with timeout and error isolation
+  const runOneScan = async (entry: typeof scanEntries[0], index: number) => {
+    logger.info(`[Batch ${batchId}] Starting scan ${index + 1}/${scanEntries.length}: ${entry.url}`);
 
     const orchestrator = new Orchestrator();
     const abortController = new AbortController();
@@ -481,7 +489,7 @@ app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as a
 
     io.emit('batch:progress', {
       batchId,
-      current: i + 1,
+      current: index + 1,
       total: scanEntries.length,
       scanId: entry.scanId,
       url: entry.url,
@@ -489,7 +497,6 @@ app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as a
     });
 
     try {
-      // Wrap each scan in its own timeout to prevent one hanging URL from stalling the batch
       const report = await Promise.race([
         orchestrator.runScan(entry.config),
         new Promise<never>((_, reject) =>
@@ -497,6 +504,7 @@ app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as a
         ),
       ]);
 
+      completedCount++;
       if (!abortController.signal.aborted) {
         io.emit('scan:complete', {
           scanId: entry.scanId,
@@ -507,23 +515,24 @@ app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as a
         });
         io.emit('batch:progress', {
           batchId,
-          current: i + 1,
+          current: completedCount,
           total: scanEntries.length,
           scanId: entry.scanId,
           url: entry.url,
           status: 'completed',
           score: report.kpiScore.overallScore,
         });
-        logger.info(`[Batch ${batchId}] Scan ${i + 1} completed: ${entry.url} → ${report.kpiScore.overallScore}`);
+        logger.info(`[Batch ${batchId}] Scan ${index + 1} completed: ${entry.url} → ${report.kpiScore.overallScore}`);
       }
     } catch (error) {
+      completedCount++;
       const errMsg = error instanceof Error ? error.message : String(error);
-      logger.error(`[Batch ${batchId}] Scan ${i + 1} failed: ${entry.url}`, { error: errMsg });
+      logger.error(`[Batch ${batchId}] Scan ${index + 1} failed: ${entry.url}`, { error: errMsg });
 
       io.emit('scan:error', { scanId: entry.scanId, url: entry.url, error: errMsg, batchId });
       io.emit('batch:progress', {
         batchId,
-        current: i + 1,
+        current: completedCount,
         total: scanEntries.length,
         scanId: entry.scanId,
         url: entry.url,
@@ -532,6 +541,24 @@ app.post('/api/scans/batch', authMiddleware, requireRole('admin', 'devops') as a
       });
     } finally {
       runningScans.delete(entry.scanId);
+    }
+  };
+
+  // ── Process in parallel batches of BATCH_CONCURRENCY ──
+  try {
+    for (let i = 0; i < scanEntries.length; i += BATCH_CONCURRENCY) {
+      const chunk = scanEntries.slice(i, i + BATCH_CONCURRENCY);
+      await Promise.allSettled(chunk.map((entry, j) => runOneScan(entry, i + j)));
+
+      // Brief pause between parallel chunks for resource cleanup
+      if (i + BATCH_CONCURRENCY < scanEntries.length) {
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+      }
+    }
+  } finally {
+    // Always release the batch lock
+    if (activeBatchId === batchId) {
+      activeBatchId = null;
     }
   }
 
