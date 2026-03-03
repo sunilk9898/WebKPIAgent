@@ -947,19 +947,37 @@ export class PerformanceAgent extends BaseAgent {
   // ---------------------------------------------------------------------------
   private populateMetadata(platforms: Platform[]): void {
     // ── Lighthouse Metrics ──
-    // Use desktop scores as primary (matches Chrome DevTools); fall back to mobile
+    // Use desktop scores as primary (matches Chrome DevTools); fall back to mobile.
+    // IMPORTANT: Always populate lighthouseData so dashboard donut charts always render.
+    // When Lighthouse fails, estimate performanceScore from CWV data.
     const primaryLH = this._lhScoresMap['desktop'] || this._lhScoresMap['mweb'] || null;
-    const lighthouseData = primaryLH
-      ? {
-          performanceScore: primaryLH.performance,
-          accessibilityScore: primaryLH.accessibility,
-          bestPracticesScore: primaryLH.bestPractices,
-          seoScore: primaryLH.seo,
-          pwaScore: 0,
-          // Include both platforms when available for detailed comparison
-          ...(Object.keys(this._lhScoresMap).length > 1 ? { byPlatform: this._lhScoresMap } : {}),
-        }
-      : null;
+    let lighthouseData: Record<string, unknown>;
+    if (primaryLH) {
+      lighthouseData = {
+        performanceScore: primaryLH.performance,
+        accessibilityScore: primaryLH.accessibility,
+        bestPracticesScore: primaryLH.bestPractices,
+        seoScore: primaryLH.seo,
+        pwaScore: 0,
+        estimated: false,
+        ...(Object.keys(this._lhScoresMap).length > 1 ? { byPlatform: this._lhScoresMap } : {}),
+      };
+    } else {
+      // Lighthouse failed — estimate performance from CWV so dashboard always shows gauges
+      const cwvLcp = this._cwvValuesMap['desktop']?.lcp?.value || this._cwvValuesMap['mweb']?.lcp?.value || 0;
+      const estPerf = cwvLcp > 0
+        ? (cwvLcp <= 2500 ? 90 : cwvLcp <= 4000 ? Math.round(90 - ((cwvLcp - 2500) / 1500) * 40) : Math.max(10, Math.round(50 - ((cwvLcp - 4000) / 4000) * 40)))
+        : 50;
+      lighthouseData = {
+        performanceScore: estPerf,
+        accessibilityScore: 0,
+        bestPracticesScore: 0,
+        seoScore: 0,
+        pwaScore: 0,
+        estimated: true,
+      };
+      this.logger.warn(`Lighthouse failed — estimated performanceScore=${estPerf} from CWV LCP=${cwvLcp}ms for dashboard`);
+    }
 
     // ── Core Web Vitals ──
     // Use desktop CWV as primary; fall back to mobile

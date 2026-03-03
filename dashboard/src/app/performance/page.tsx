@@ -99,10 +99,17 @@ export default function PerformancePage() {
       {/* ── OVERVIEW TAB ── */}
       {activeTab === "overview" && (
         <div className="space-y-6">
-          {/* Lighthouse Gauges */}
+          {/* Lighthouse Gauges — always shown; uses estimated values when Lighthouse scan fails */}
           {meta?.lighthouse && (
             <div className="card p-6">
-              <h3 className="text-sm font-semibold text-gray-200 mb-4">Lighthouse Scores</h3>
+              <div className="flex items-center gap-2 mb-4">
+                <h3 className="text-sm font-semibold text-gray-200">Lighthouse Scores</h3>
+                {meta.lighthouse.estimated && (
+                  <span className="text-[10px] px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-400 font-medium">
+                    ESTIMATED FROM CWV
+                  </span>
+                )}
+              </div>
               <div className="grid grid-cols-2 md:grid-cols-5 gap-6 items-center">
                 <div className="col-span-2 md:col-span-1 flex justify-center">
                   <KPIGauge score={meta.lighthouse.performanceScore} label="Performance" size="lg" />
