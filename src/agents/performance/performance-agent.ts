@@ -67,7 +67,7 @@ const LIGHTHOUSE_DESKTOP_CONFIG = {
       disabled: false,
     },
     emulatedUserAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-    onlyCategories: ['performance', 'accessibility', 'best-practices', 'seo'],
+    onlyCategories: ['performance', 'accessibility', 'best-practices', 'seo', 'pwa'],
     // maxWaitForLoad — use Lighthouse default (45s) for stability
   },
 };
@@ -93,7 +93,7 @@ const LIGHTHOUSE_MOBILE_CONFIG = {
       disabled: false,
     },
     emulatedUserAgent: 'Mozilla/5.0 (Linux; Android 11; moto g power (2022)) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36',
-    onlyCategories: ['performance', 'accessibility', 'best-practices', 'seo'],
+    onlyCategories: ['performance', 'accessibility', 'best-practices', 'seo', 'pwa'],
   },
 };
 
@@ -163,7 +163,7 @@ export class PerformanceAgent extends BaseAgent {
   private _activeBrowsers: Browser[] = [];
 
   // ── Metric collectors for metadata (per-platform to avoid overwrite) ──
-  private _lhScoresMap: Record<string, { performance: number; accessibility: number; bestPractices: number; seo: number }> = {};
+  private _lhScoresMap: Record<string, { performance: number; accessibility: number; bestPractices: number; seo: number; pwa: number }> = {};
   private _cwvValuesMap: Record<string, Record<string, { value: number; rating: 'good' | 'needs-improvement' | 'poor' }>> = {};
   private _playerMetrics: Record<string, number> = {};
   private _resourceData: { totalSize: number; jsSize: number; cssSize: number; imageSize: number; fontSize: number; thirdPartySize: number; requestCount: number; renderBlocking: string[] } | null = null;
@@ -446,15 +446,16 @@ export class PerformanceAgent extends BaseAgent {
       variance,
     });
 
-    // Store median scores per-platform for metadata
+    // Store median scores per-platform for metadata (all 5 Lighthouse categories)
     this._lhScoresMap[platform] = {
       performance: finalScore,
       accessibility: Math.round((finalLhr.categories.accessibility?.score || 0) * 100),
       bestPractices: Math.round((finalLhr.categories['best-practices']?.score || 0) * 100),
       seo: Math.round((finalLhr.categories.seo?.score || 0) * 100),
+      pwa: Math.round((finalLhr.categories.pwa?.score || 0) * 100),
     };
 
-    this.logger.info(`Lighthouse ${platform} (median of ${runResults.length}): Performance=${finalScore}, Accessibility=${this._lhScoresMap[platform].accessibility}, BestPractices=${this._lhScoresMap[platform].bestPractices}, SEO=${this._lhScoresMap[platform].seo}`);
+    this.logger.info(`Lighthouse ${platform} (median of ${runResults.length}): Performance=${finalScore}, Accessibility=${this._lhScoresMap[platform].accessibility}, BestPractices=${this._lhScoresMap[platform].bestPractices}, SEO=${this._lhScoresMap[platform].seo}, PWA=${this._lhScoresMap[platform].pwa}`);
 
     // Check against target
     if (finalScore < THRESHOLDS.lighthouseScore) {
@@ -958,7 +959,7 @@ export class PerformanceAgent extends BaseAgent {
         accessibilityScore: primaryLH.accessibility,
         bestPracticesScore: primaryLH.bestPractices,
         seoScore: primaryLH.seo,
-        pwaScore: 0,
+        pwaScore: primaryLH.pwa,
         estimated: false,
         ...(Object.keys(this._lhScoresMap).length > 1 ? { byPlatform: this._lhScoresMap } : {}),
       };
