@@ -50,11 +50,11 @@ interface QueuedScanJob {
   error?: string;
 }
 
-// On 4-vCPU/8GB EC2: only 1 concurrent scan to avoid Chrome resource contention.
-// Each scan needs multiple Chrome instances (Lighthouse, CWV, CDN, Resource)
-// and Lighthouse requires stable CPU/memory for accurate trace collection.
-// Increase to 2 when running on 8+ vCPU instances.
-const MAX_CONCURRENT_SCANS = 1;
+// Concurrent scan limit: 2 allows batch scans to run faster while keeping
+// Chrome resource contention manageable on a t3.medium (2 vCPU / 4GB).
+// Each scan runs Chrome sequentially within itself, so 2 concurrent scans
+// typically alternate CPU-heavy phases. Override via SCAN_CONCURRENCY env var.
+const MAX_CONCURRENT_SCANS = parseInt(process.env.SCAN_CONCURRENCY || '2');
 const scanQueue: QueuedScanJob[] = [];
 const activeJobs = new Map<string, {
   job: QueuedScanJob;
@@ -243,6 +243,11 @@ function processQueue(): void {
     });
 
     logger.info(`Scan started: ${nextJob.url} (by ${nextJob.userEmail}, queue: ${scanQueue.filter(j => j.status === 'queued').length} remaining)`);
+
+    // Emit batch:progress with "running" status so UI updates immediately
+    if (nextJob.batchId) {
+      emitBatchProgress(nextJob);
+    }
 
     // Run scan asynchronously (don't await)
     executeScanJob(nextJob, orchestrator, abortController);
