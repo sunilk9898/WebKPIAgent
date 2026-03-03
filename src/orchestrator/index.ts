@@ -27,7 +27,7 @@ import {
   ScanTarget, Platform, ScoreThresholds, NotificationConfig,
 } from '../types';
 
-const AGENT_TIMEOUT_MS = 240_000;  // 4 minutes per agent (reduced from 5m — LH retries reduced)
+const AGENT_TIMEOUT_MS = 600_000;  // 10 minutes per agent (3-run median × 2 platforms needs ~6-7 min)
 
 export type ScanProgressCallback = (phase: string, agentType: string, progress: number, status: string) => void;
 

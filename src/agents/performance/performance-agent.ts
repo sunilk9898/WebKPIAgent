@@ -2,15 +2,19 @@
 // Performance Agent - Lighthouse, Core Web Vitals, Player Metrics, CDN
 // ============================================================================
 //
-// Scoring model (v2 — Lighthouse-aligned):
-//   Lighthouse Score:       75 points  (directly proportional to raw LH score)
-//   Player Metrics:         10 points  (OTT-specific startup, ABR)
-//   CDN Efficiency:          8 points  (cache headers, compression)
-//   Resource Optimization:   7 points  (page weight, render-blocking)
+// Scoring model (v3 — Chrome DevTools aligned):
+//   Lighthouse Score:       85 points  (directly proportional to raw LH score)
+//   Player Metrics:          6 points  (OTT-specific startup, ABR)
+//   CDN Efficiency:          5 points  (cache headers, compression)
+//   Resource Optimization:   4 points  (page weight, render-blocking)
 //   TOTAL:                 100 points
 //
-// This ensures the VZY Performance Score closely tracks the Lighthouse
-// performance score while still accounting for OTT-specific factors.
+// v3 changes: Lighthouse increased from 75→85 pts to minimize gap between
+// VZY Performance Score and Chrome DevTools Lighthouse score. The remaining
+// 15 pts are OTT-specific adjustments that Chrome doesn't measure.
+//
+// Multi-run median: Lighthouse is run LIGHTHOUSE_RUNS times per platform;
+// the MEDIAN score is used to reduce run-to-run variance from ±10 to ±3-5.
 // ============================================================================
 
 import puppeteer, { Browser, Page } from 'puppeteer';
@@ -39,12 +43,14 @@ const THRESHOLDS = {
 
 // ── Lighthouse configuration matching Chrome DevTools defaults exactly ──
 // Uses 'simulate' (Lantern) throttling for hardware-independent scores.
-// Lantern requires complete trace data — the anti-backgrounding Chrome flags
-// above ensure performance marks are emitted in headless/Docker mode.
+// Lantern simulates throttled conditions from an unthrottled trace, producing
+// scores that are LESS hardware-dependent than 'devtools' throttling.
+// This is the same method Chrome DevTools → Lighthouse panel uses.
 const LIGHTHOUSE_DESKTOP_CONFIG = {
   extends: 'lighthouse:default' as const,
   settings: {
     formFactor: 'desktop' as const,
+    throttlingMethod: 'simulate' as const, // Explicit: same as Chrome DevTools default
     throttling: {
       rttMs: 40,
       throughputKbps: 10240,
@@ -70,6 +76,7 @@ const LIGHTHOUSE_MOBILE_CONFIG = {
   extends: 'lighthouse:default' as const,
   settings: {
     formFactor: 'mobile' as const,
+    throttlingMethod: 'simulate' as const, // Explicit: same as Chrome DevTools default
     throttling: {
       rttMs: 150,
       throughputKbps: 1638.4,
@@ -90,8 +97,12 @@ const LIGHTHOUSE_MOBILE_CONFIG = {
   },
 };
 
-// Max retry attempts for Lighthouse when it returns 0/null (reduced from 3 to 2 for faster scans)
-const LIGHTHOUSE_MAX_RETRIES = 2;
+// ── Multi-run strategy for score consistency ──
+// Lighthouse has inherent variance of ±5-10 pts per run. Running multiple times
+// and taking the MEDIAN reduces variance to ±2-5 pts (per Google's own docs).
+// We run 3 times for each platform and use the median score.
+// In resource-constrained environments (AWS t3.medium), reduce to 2 runs.
+const LIGHTHOUSE_RUNS = process.env.LIGHTHOUSE_RUNS ? parseInt(process.env.LIGHTHOUSE_RUNS) : 3;
 
 // Chrome flags for Lighthouse via chrome-launcher.
 //
@@ -107,6 +118,7 @@ const CHROME_FLAGS = [
   '--disable-gpu',
   '--no-first-run',
   '--disable-extensions',
+  '--disable-dev-shm-usage',  // Critical: use /tmp instead of /dev/shm (often undersized in Docker)
   // Anti-backgrounding: prevent renderer throttling in headless mode
   // (without these, performance marks FCP/LCP are missing from traces)
   '--disable-renderer-backgrounding',
@@ -304,23 +316,28 @@ export class PerformanceAgent extends BaseAgent {
   }
 
   // ---------------------------------------------------------------------------
-  // Lighthouse Audit (with retry logic for reliability)
+  // Lighthouse Audit — Multi-run median strategy for consistency
+  // ---------------------------------------------------------------------------
+  // Per Google's docs, Lighthouse has ±5-10 pt variance per run. Running N times
+  // and taking the MEDIAN halves variance to ±2-5 pts. We run LIGHTHOUSE_RUNS
+  // times, discard score=0 failures, and pick the median result.
   // ---------------------------------------------------------------------------
   private async runLighthouse(url: string, platform: Platform): Promise<void> {
-    this.logger.info(`Running Lighthouse for ${platform}`);
+    this.logger.info(`Running Lighthouse for ${platform} (${LIGHTHOUSE_RUNS} runs, median strategy)`);
 
     if (!this.chrome) return;
 
-    // Use exact Chrome DevTools config to ensure score alignment
     const config = platform === 'mweb' ? LIGHTHOUSE_MOBILE_CONFIG : LIGHTHOUSE_DESKTOP_CONFIG;
+    const chromePath = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
 
+    // Collect all valid run results
+    const runResults: { score: number; lhr: any }[] = [];
     let lastError: string | null = null;
-    let bestScore = 0;
-    let bestLhr: any = null;
+    let consecutiveFailures = 0;
 
-    for (let attempt = 1; attempt <= LIGHTHOUSE_MAX_RETRIES; attempt++) {
+    for (let run = 1; run <= LIGHTHOUSE_RUNS; run++) {
       try {
-        this.logger.info(`Lighthouse attempt ${attempt}/${LIGHTHOUSE_MAX_RETRIES} for ${platform}`);
+        this.logger.info(`Lighthouse run ${run}/${LIGHTHOUSE_RUNS} for ${platform}`);
 
         const result = await lighthouse(url, {
           port: this.chrome.port,
@@ -330,112 +347,76 @@ export class PerformanceAgent extends BaseAgent {
 
         if (!result?.lhr) {
           lastError = 'Lighthouse returned no result';
-          this.logger.warn(`Lighthouse attempt ${attempt}/${LIGHTHOUSE_MAX_RETRIES}: no LHR returned for ${platform}`);
-          continue;
+          this.logger.warn(`Lighthouse run ${run}/${LIGHTHOUSE_RUNS}: no LHR returned for ${platform}`);
+          consecutiveFailures++;
+        } else {
+          const lhr = result.lhr;
+          const perfScore = Math.round((lhr.categories.performance?.score || 0) * 100);
+
+          // Log score=0 diagnostics
+          if (perfScore === 0) {
+            const runtimeErrors = lhr.runtimeError?.code || 'none';
+            this.logger.warn(`Lighthouse run ${run} score=0 diagnostics`, {
+              platform, run, chromePort: this.chrome?.port,
+              runtimeError: runtimeErrors,
+              fcp: lhr.audits?.['first-contentful-paint']?.numericValue || 'missing',
+              lcp: lhr.audits?.['largest-contentful-paint']?.numericValue || 'missing',
+              auditsCount: Object.keys(lhr.audits || {}).length,
+            });
+            consecutiveFailures++;
+          } else {
+            runResults.push({ score: perfScore, lhr });
+            consecutiveFailures = 0;
+          }
+
+          this.logger.info(`Lighthouse run ${run}: ${platform} score = ${perfScore}`);
         }
 
-        const lhr = result.lhr;
-        // Round to avoid floating point artifacts (0.57 * 100 = 56.999... → 57)
-        const perfScore = Math.round((lhr.categories.performance?.score || 0) * 100);
-
-        // Detailed logging when score is 0 — helps diagnose Docker/Chrome issues
-        if (perfScore === 0) {
-          const fcp = lhr.audits?.['first-contentful-paint']?.numericValue;
-          const lcp = lhr.audits?.['largest-contentful-paint']?.numericValue;
-          const si = lhr.audits?.['speed-index']?.numericValue;
-          const runtimeErrors = lhr.runtimeError?.code || 'none';
-          const categories = Object.keys(lhr.categories || {}).map(k => `${k}:${lhr.categories[k]?.score}`).join(', ');
-          this.logger.warn(`Lighthouse score=0 diagnostics`, {
-            platform,
-            attempt,
-            chromePort: this.chrome?.port,
-            runtimeError: runtimeErrors,
-            fcp: fcp || 'missing',
-            lcp: lcp || 'missing',
-            speedIndex: si || 'missing',
-            categories,
-            auditsCount: Object.keys(lhr.audits || {}).length,
-          });
-        }
-
-        // Track best score across attempts (Docker/container scans can be flaky)
-        if (perfScore > bestScore) {
-          bestScore = perfScore;
-          bestLhr = lhr;
-        }
-
-        this.logger.info(`Lighthouse attempt ${attempt}: ${platform} score = ${perfScore}`);
-
-        // ── Detect Lighthouse failure: score of 0 likely means scan didn't complete ──
-        // Also retry if score seems abnormally low (LanternError produces unreliable scores)
-        if (perfScore === 0 && attempt < LIGHTHOUSE_MAX_RETRIES) {
-          this.logger.warn(`Lighthouse attempt ${attempt}/${LIGHTHOUSE_MAX_RETRIES}: performance score is 0 for ${platform}, retrying...`);
-          // Kill and relaunch Chrome for a fresh connection
+        // If 2+ consecutive failures, relaunch Chrome
+        if (consecutiveFailures >= 2 && run < LIGHTHOUSE_RUNS) {
+          this.logger.warn('2+ consecutive Lighthouse failures, relaunching Chrome...');
           await this.chrome.kill();
-          const chromePath = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
           this.chrome = await chromeLauncher.launch({
             chromeFlags: CHROME_FLAGS,
             ignoreDefaultFlags: true,
             ...(chromePath ? { chromePath } : {}),
           });
-          // Brief pause to let Chrome stabilize
           await new Promise(resolve => setTimeout(resolve, 2000));
-          continue;
+          consecutiveFailures = 0;
         }
-
-        // If score is reasonable (>0), this attempt is good enough
-        // But keep going if we haven't hit max attempts yet AND score seems unreliably low
-        if (perfScore > 0 && attempt < LIGHTHOUSE_MAX_RETRIES && perfScore < 20) {
-          this.logger.warn(`Lighthouse attempt ${attempt}: ${platform} score=${perfScore} seems low, retrying for better result...`);
-          // Kill and relaunch Chrome for a fresh connection
-          await this.chrome.kill();
-          const chromePath2 = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-          this.chrome = await chromeLauncher.launch({
-            chromeFlags: CHROME_FLAGS,
-            ignoreDefaultFlags: true,
-            ...(chromePath2 ? { chromePath: chromePath2 } : {}),
-          });
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          continue;
-        }
-
-        // Good score or last attempt — exit loop
-        break;
       } catch (error) {
         lastError = String(error);
-        this.logger.warn(`Lighthouse attempt ${attempt}/${LIGHTHOUSE_MAX_RETRIES} failed for ${platform}: ${lastError}`);
+        this.logger.warn(`Lighthouse run ${run}/${LIGHTHOUSE_RUNS} failed for ${platform}: ${lastError}`);
+        consecutiveFailures++;
 
-        if (attempt < LIGHTHOUSE_MAX_RETRIES) {
-          // Relaunch Chrome for a clean retry
+        // Relaunch Chrome after exception
+        if (run < LIGHTHOUSE_RUNS) {
           try {
             await this.chrome.kill();
-            const chromePath3 = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
             this.chrome = await chromeLauncher.launch({
               chromeFlags: CHROME_FLAGS,
               ignoreDefaultFlags: true,
-              ...(chromePath3 ? { chromePath: chromePath3 } : {}),
+              ...(chromePath ? { chromePath } : {}),
             });
             await new Promise(resolve => setTimeout(resolve, 2000));
+            consecutiveFailures = 0;
           } catch (relaunchErr) {
-            this.logger.error('Failed to relaunch Chrome for retry', { error: String(relaunchErr) });
+            this.logger.error('Failed to relaunch Chrome', { error: String(relaunchErr) });
           }
         }
       }
     }
 
-    // ── Use the BEST score from all attempts ──
-    const finalScore = bestScore;
-    const finalLhr = bestLhr;
-
-    if (finalScore === 0 || !finalLhr) {
-      this.logger.error(`Lighthouse failed: best performance score is 0 after ${LIGHTHOUSE_MAX_RETRIES} attempts for ${platform}`);
+    // ── Select MEDIAN result ──
+    if (runResults.length === 0) {
+      this.logger.error(`Lighthouse failed: 0 valid runs out of ${LIGHTHOUSE_RUNS} for ${platform}`);
       this.addFinding({
         severity: 'info',
         category: 'Lighthouse',
         title: `Lighthouse scan incomplete for ${platform}`,
-        description: `Lighthouse could not calculate a performance score for ${platform}. The best score across ${LIGHTHOUSE_MAX_RETRIES} attempts was 0.`,
+        description: `Lighthouse could not calculate a performance score for ${platform}. All ${LIGHTHOUSE_RUNS} runs returned score 0 or failed.`,
         location: { url },
-        evidence: `Score: 0 after ${LIGHTHOUSE_MAX_RETRIES} attempts. Last error: ${lastError || 'none'}`,
+        evidence: `0 valid runs out of ${LIGHTHOUSE_RUNS}. Last error: ${lastError || 'none'}`,
         remediation: 'Check if the site blocks headless Chrome. Try running Chrome DevTools Lighthouse manually to compare.',
         references: [],
         autoFixable: false,
@@ -443,7 +424,29 @@ export class PerformanceAgent extends BaseAgent {
       return;
     }
 
-    // Store BEST scores per-platform for metadata
+    // Sort by score and pick median
+    runResults.sort((a, b) => a.score - b.score);
+    const medianIdx = Math.floor(runResults.length / 2);
+    const medianResult = runResults[medianIdx];
+    const allScores = runResults.map(r => r.score);
+    const minScore = allScores[0];
+    const maxScore = allScores[allScores.length - 1];
+    const variance = maxScore - minScore;
+
+    const finalScore = medianResult.score;
+    const finalLhr = medianResult.lhr;
+
+    this.logger.info(`Lighthouse ${platform} median selection`, {
+      runs: LIGHTHOUSE_RUNS,
+      validRuns: runResults.length,
+      allScores: allScores.join(', '),
+      median: finalScore,
+      min: minScore,
+      max: maxScore,
+      variance,
+    });
+
+    // Store median scores per-platform for metadata
     this._lhScoresMap[platform] = {
       performance: finalScore,
       accessibility: Math.round((finalLhr.categories.accessibility?.score || 0) * 100),
@@ -451,7 +454,7 @@ export class PerformanceAgent extends BaseAgent {
       seo: Math.round((finalLhr.categories.seo?.score || 0) * 100),
     };
 
-    this.logger.info(`Lighthouse ${platform} (best of ${LIGHTHOUSE_MAX_RETRIES}): Performance=${finalScore}, Accessibility=${this._lhScoresMap[platform].accessibility}, BestPractices=${this._lhScoresMap[platform].bestPractices}, SEO=${this._lhScoresMap[platform].seo}`);
+    this.logger.info(`Lighthouse ${platform} (median of ${runResults.length}): Performance=${finalScore}, Accessibility=${this._lhScoresMap[platform].accessibility}, BestPractices=${this._lhScoresMap[platform].bestPractices}, SEO=${this._lhScoresMap[platform].seo}`);
 
     // Check against target
     if (finalScore < THRESHOLDS.lighthouseScore) {
@@ -459,13 +462,15 @@ export class PerformanceAgent extends BaseAgent {
         severity: finalScore < 50 ? 'critical' : finalScore < 80 ? 'high' : 'medium',
         category: 'Lighthouse',
         title: `Lighthouse performance score: ${finalScore} (target: ${THRESHOLDS.lighthouseScore})`,
-        description: `${platform} Lighthouse performance score is ${finalScore}/100, below the target of ${THRESHOLDS.lighthouseScore}.`,
+        description: `${platform} Lighthouse performance score is ${finalScore}/100, below the target of ${THRESHOLDS.lighthouseScore}. (Median of ${runResults.length} runs; range: ${minScore}-${maxScore})`,
         location: { url },
         evidence: JSON.stringify({
           performance: finalScore,
           accessibility: this._lhScoresMap[platform].accessibility,
           bestPractices: this._lhScoresMap[platform].bestPractices,
           seo: this._lhScoresMap[platform].seo,
+          runs: allScores,
+          variance,
         }),
         remediation: this.generateLighthouseRemediation(finalLhr),
         references: [],
@@ -473,7 +478,22 @@ export class PerformanceAgent extends BaseAgent {
       });
     }
 
-    // Extract individual audit failures from best result
+    // Warn if variance is very high (indicates environment instability)
+    if (variance > 15 && runResults.length >= 2) {
+      this.addFinding({
+        severity: 'info',
+        category: 'Lighthouse',
+        title: `High Lighthouse variance for ${platform}: ${variance} pts (${allScores.join(', ')})`,
+        description: `Lighthouse scores varied by ${variance} points across ${runResults.length} runs. This may indicate CPU contention, network instability, or non-deterministic page content.`,
+        location: { url },
+        evidence: `Scores: ${allScores.join(', ')} | Variance: ${variance}`,
+        remediation: 'Ensure no other heavy processes are running during scans. Consider running scans on dedicated hardware.',
+        references: ['https://github.com/GoogleChrome/lighthouse/blob/main/docs/variability.md'],
+        autoFixable: false,
+      });
+    }
+
+    // Extract individual audit failures from median result
     const failedAudits = Object.values(finalLhr.audits)
       .filter((audit: any) => audit.score !== null && audit.score < 0.9 && audit.scoreDisplayMode === 'numeric')
       .sort((a: any, b: any) => (a.score || 0) - (b.score || 0))
@@ -997,25 +1017,20 @@ export class PerformanceAgent extends BaseAgent {
   // Scoring (v2 — Lighthouse-aligned, 75/10/8/7 split)
   // ---------------------------------------------------------------------------
   protected calculateScore(): WeightedScore {
-    // ── Lighthouse-aligned scoring (v2) ──
+    // ── Chrome DevTools–aligned scoring (v3) ──
     //
-    // Problem solved: VZY Performance Score must closely track Chrome Lighthouse
-    // so users can directly compare the two. Previously, the 60/15/13/12 split
-    // allowed CDN/Resource penalties to push the score far below Lighthouse.
+    // Goal: VZY Performance Score ≈ Chrome Lighthouse Performance Score (±5 pts)
+    // Lighthouse gets 85/100 pts so VZY score closely tracks Chrome DevTools.
+    // Remaining 15 pts = OTT-specific factors Chrome doesn't measure.
     //
-    // New model: Lighthouse is the DOMINANT driver (75 pts), with OTT-specific
-    // categories adding modest adjustments (25 pts combined).
-    //
-    // Example: Lighthouse 56 → 56% of 75 = 42 pts + OTT bonuses → ~52-57 range
-    // Previously: Lighthouse 56 → 56% of 60 = 33.6 + OTT → ~40 range (too low)
+    // Example: Lighthouse 63 → 63% of 85 = 53.55 + OTT ~12 → VZY ~66 (vs Chrome 63)
+    // Old v2:  Lighthouse 63 → 63% of 75 = 47.25 + OTT ~17 → VZY ~64 (wider gap possible)
 
-    // 1. LIGHTHOUSE SCORE (75 points) — directly proportional to actual Lighthouse score
-    //    Use desktop score as primary (matches Chrome DevTools comparison)
-    //    Fall back to mobile if desktop failed
+    // 1. LIGHTHOUSE SCORE (85 points) — directly proportional to actual Lighthouse score
+    //    Use desktop as primary (matches Chrome DevTools comparison), fall back to mobile
     const lighthouseFindings = this.findings.filter((f) => f.category === 'Lighthouse');
     const desktopLH = this._lhScoresMap['desktop']?.performance;
     const mobileLH = this._lhScoresMap['mweb']?.performance;
-    // Prefer desktop; if desktop is missing (scan failed), use mobile
     const primaryLHScore = (desktopLH !== undefined && desktopLH > 0)
       ? desktopLH
       : (mobileLH !== undefined && mobileLH > 0)
@@ -1024,23 +1039,18 @@ export class PerformanceAgent extends BaseAgent {
 
     let lighthouseActual: number;
     if (primaryLHScore !== null) {
-      // Normal case: Lighthouse returned a valid score
-      lighthouseActual = Math.round((primaryLHScore / 100) * 75 * 100) / 100;
+      lighthouseActual = Math.round((primaryLHScore / 100) * 85 * 100) / 100;
     } else {
-      // Lighthouse FAILED — estimate from CWV data if available, otherwise use 50% as penalty
-      // We can't give full marks when Lighthouse didn't actually run.
+      // Lighthouse FAILED — estimate from CWV data if available
       const cwvLcp = this._cwvValuesMap['desktop']?.lcp?.value || this._cwvValuesMap['mweb']?.lcp?.value || 0;
       const cwvFcp = this._cwvValuesMap['desktop']?.fcp?.value || this._cwvValuesMap['mweb']?.fcp?.value || 0;
       if (cwvLcp > 0 || cwvFcp > 0) {
-        // Estimate a rough Lighthouse-equivalent score from CWV metrics
-        // LCP <2.5s = good (90+), <4s = needs-improvement (50-89), >4s = poor (<50)
         const lcpScore = cwvLcp <= 2500 ? 90 : cwvLcp <= 4000 ? Math.round(90 - ((cwvLcp - 2500) / 1500) * 40) : Math.max(10, Math.round(50 - ((cwvLcp - 4000) / 4000) * 40));
-        lighthouseActual = Math.round((lcpScore / 100) * 75 * 100) / 100;
-        this.logger.warn(`Lighthouse failed — estimated score from CWV LCP (${cwvLcp}ms → ~${lcpScore}/100 → ${lighthouseActual}/75)`);
+        lighthouseActual = Math.round((lcpScore / 100) * 85 * 100) / 100;
+        this.logger.warn(`Lighthouse failed — estimated score from CWV LCP (${cwvLcp}ms → ~${lcpScore}/100 → ${lighthouseActual}/85)`);
       } else {
-        // No CWV data either — use 50% as a neutral penalty (37.5/75)
-        lighthouseActual = 37.5;
-        this.logger.warn('Lighthouse failed and no CWV data available — using 50% default (37.5/75)');
+        lighthouseActual = 42.5; // 50% default (42.5/85)
+        this.logger.warn('Lighthouse failed and no CWV data available — using 50% default (42.5/85)');
       }
     }
     const lighthouseAuditFindings = this.findings.filter((f) => f.category === 'Lighthouse Audit');
@@ -1048,39 +1058,38 @@ export class PerformanceAgent extends BaseAgent {
     // 2. CWV — NOT scored (already in Lighthouse). Kept for dashboard display only.
     const cwvFindings = this.findings.filter((f) => f.category === 'Core Web Vitals');
 
-    // 3. PLAYER METRICS (10 points) — OTT-specific, not part of Lighthouse
+    // 3. PLAYER METRICS (6 points) — OTT-specific, not part of Lighthouse
     const playerFindings = this.findings.filter((f) => f.category.includes('Player'));
     const playerPenalty = playerFindings.reduce((sum, f) => {
-      const w = f.severity === 'critical' ? 6 : f.severity === 'high' ? 3 : 1;
+      const w = f.severity === 'critical' ? 4 : f.severity === 'high' ? 2 : 1;
       return sum + w;
     }, 0);
-    const playerActual = Math.max(0, 10 - Math.min(playerPenalty, 10));
+    const playerActual = Math.max(0, 6 - Math.min(playerPenalty, 6));
 
-    // 4. CDN EFFICIENCY (8 points) — OTT-specific (CDN config, cache headers, compression)
-    //    Now using grouped findings (max 2-3 findings instead of 40+)
+    // 4. CDN EFFICIENCY (5 points) — OTT-specific (CDN config, cache headers, compression)
     const cdnFindings = this.findings.filter((f) => f.category.includes('CDN'));
     const cdnPenalty = cdnFindings.reduce((sum, f) => {
-      const w = f.severity === 'critical' ? 5 : f.severity === 'high' ? 3 : f.severity === 'medium' ? 2 : 1;
+      const w = f.severity === 'critical' ? 3 : f.severity === 'high' ? 2 : 1;
       return sum + w;
     }, 0);
-    const cdnActual = Math.max(0, 8 - Math.min(cdnPenalty, 8));
+    const cdnActual = Math.max(0, 5 - Math.min(cdnPenalty, 5));
 
-    // 5. RESOURCE OPTIMIZATION (7 points) — page weight, render-blocking
+    // 5. RESOURCE OPTIMIZATION (4 points) — page weight, render-blocking
     const resourceFindings = this.findings.filter((f) =>
       f.category.includes('Resource') || f.category.includes('Render'),
     );
     const resourcePenalty = resourceFindings.reduce((sum, f) => {
-      const w = f.severity === 'critical' ? 4 : f.severity === 'high' ? 3 : 1;
+      const w = f.severity === 'critical' ? 3 : f.severity === 'high' ? 2 : 1;
       return sum + w;
     }, 0);
-    const resourceActual = Math.max(0, 7 - Math.min(resourcePenalty, 7));
+    const resourceActual = Math.max(0, 4 - Math.min(resourcePenalty, 4));
 
     const breakdown = [
       {
-        metric: 'Lighthouse Score', value: primaryLHScore || 0, maxScore: 75,
+        metric: 'Lighthouse Score', value: primaryLHScore || 0, maxScore: 85,
         actualScore: lighthouseActual,
-        penalty: Math.round((75 - lighthouseActual) * 100) / 100,
-        details: `Raw LH: ${primaryLHScore ?? 'N/A'}/100 → ${lighthouseActual}/75 | ${lighthouseFindings.length} finding(s), ${lighthouseAuditFindings.length} audit(s)`,
+        penalty: Math.round((85 - lighthouseActual) * 100) / 100,
+        details: `Raw LH: ${primaryLHScore ?? 'N/A'}/100 → ${lighthouseActual}/85 | ${lighthouseFindings.length} finding(s), ${lighthouseAuditFindings.length} audit(s)`,
       },
       {
         metric: 'Core Web Vitals (info)', value: 0, maxScore: 0,
@@ -1089,21 +1098,21 @@ export class PerformanceAgent extends BaseAgent {
         details: `${cwvFindings.length} finding(s) — included in Lighthouse score`,
       },
       {
-        metric: 'Player Metrics', value: 0, maxScore: 10,
+        metric: 'Player Metrics', value: 0, maxScore: 6,
         actualScore: playerActual,
-        penalty: Math.min(playerPenalty, 10),
+        penalty: Math.min(playerPenalty, 6),
         details: `${playerFindings.length} finding(s)`,
       },
       {
-        metric: 'CDN Efficiency', value: 0, maxScore: 8,
+        metric: 'CDN Efficiency', value: 0, maxScore: 5,
         actualScore: cdnActual,
-        penalty: Math.min(cdnPenalty, 8),
+        penalty: Math.min(cdnPenalty, 5),
         details: `${cdnFindings.length} grouped finding(s)`,
       },
       {
-        metric: 'Resource Optimization', value: 0, maxScore: 7,
+        metric: 'Resource Optimization', value: 0, maxScore: 4,
         actualScore: resourceActual,
-        penalty: Math.min(resourcePenalty, 7),
+        penalty: Math.min(resourcePenalty, 4),
         details: `${resourceFindings.length} finding(s)`,
       },
     ];
@@ -1111,7 +1120,7 @@ export class PerformanceAgent extends BaseAgent {
     const rawScore = this.clampScore(breakdown.reduce((sum, b) => sum + b.actualScore, 0));
 
     // Log score breakdown for debugging
-    this.logger.info('Performance score breakdown', {
+    this.logger.info('Performance score breakdown (v3)', {
       rawScore,
       lighthouseInput: primaryLHScore,
       lighthouseActual,
@@ -1119,14 +1128,15 @@ export class PerformanceAgent extends BaseAgent {
       cdnActual,
       resourceActual,
       findingsCount: this.findings.length,
-      cdnFindingsCount: cdnFindings.length,
-      resourceFindingsCount: resourceFindings.length,
+      expectedChromeDevToolsAlignment: primaryLHScore
+        ? `LH ${primaryLHScore} → VZY ${rawScore} (gap: ${Math.abs(rawScore - primaryLHScore)} pts)`
+        : 'N/A (Lighthouse failed)',
     });
 
     return {
       category: 'performance',
       rawScore,
-      weight: 0.35,    // Performance gets 35% weight in overall KPI
+      weight: 0.35,
       weightedScore: rawScore * 0.35,
       breakdown,
     };
