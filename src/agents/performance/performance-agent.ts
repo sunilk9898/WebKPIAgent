@@ -191,21 +191,35 @@ export class PerformanceAgent extends BaseAgent {
   }
 
   /**
-   * Resolve redirects to get the final URL.
-   * This prevents Lighthouse LanternError caused by client-side or server-side
-   * redirects creating multiple navigations in the trace (e.g. vzy.one → vzy.one/en).
+   * Resolve redirects (server-side AND client-side) to get the final URL.
+   * This prevents Lighthouse LanternError caused by redirects creating
+   * multiple navigations in the trace (e.g. vzy.one → vzy.one/en).
    * The trace engine cannot map metric scores when two navigations exist.
+   *
+   * Uses Puppeteer to catch JavaScript/meta-refresh redirects that fetch() misses.
    */
   private async resolveRedirects(url: string): Promise<string> {
+    let browser: Browser | null = null;
     try {
-      const resp = await fetch(url, { method: 'HEAD', redirect: 'follow' });
-      const finalUrl = resp.url;
+      const chromePath = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
+      browser = await puppeteer.launch({
+        headless: true,
+        args: PUPPETEER_FLAGS,
+        ...(chromePath ? { executablePath: chromePath } : {}),
+      });
+      const page = await browser.newPage();
+      // Navigate and wait for redirects to settle (networkidle0 = no requests for 500ms)
+      await page.goto(url, { waitUntil: 'networkidle0', timeout: 15000 });
+      const finalUrl = page.url();
+      await page.close();
       if (finalUrl && finalUrl !== url) {
         this.logger.info(`Resolved redirect: ${url} → ${finalUrl}`);
         return finalUrl;
       }
     } catch (e) {
       this.logger.warn('Redirect resolution failed, using original URL', { error: String(e) });
+    } finally {
+      if (browser) await browser.close();
     }
     return url;
   }
