@@ -102,7 +102,7 @@ const LIGHTHOUSE_MOBILE_CONFIG = {
 // and taking the MEDIAN reduces variance to ±2-5 pts (per Google's own docs).
 // We run 3 times for each platform and use the median score.
 // In resource-constrained environments (AWS t3.medium), reduce to 2 runs.
-const LIGHTHOUSE_RUNS = process.env.LIGHTHOUSE_RUNS ? parseInt(process.env.LIGHTHOUSE_RUNS) : 3;
+const LIGHTHOUSE_RUNS = process.env.LIGHTHOUSE_RUNS ? parseInt(process.env.LIGHTHOUSE_RUNS) : 2;
 
 // Chrome flags for Lighthouse via chrome-launcher.
 //
@@ -1030,11 +1030,26 @@ export class PerformanceAgent extends BaseAgent {
         ...(Object.keys(this._lhScoresMap).length > 1 ? { byPlatform: this._lhScoresMap } : {}),
       };
     } else {
-      // Lighthouse failed — estimate performance from CWV so dashboard always shows gauges
+      // Lighthouse failed — use conservative estimate for dashboard.
+      // IMPORTANT: CWV-only estimation is unreliable (especially LCP < 200ms which
+      // usually means a cached/SW page, not real performance). Cap at 50 max.
       const cwvLcp = this._cwvValuesMap['desktop']?.lcp?.value || this._cwvValuesMap['mweb']?.lcp?.value || 0;
-      const estPerf = cwvLcp > 0
-        ? (cwvLcp <= 2500 ? 90 : cwvLcp <= 4000 ? Math.round(90 - ((cwvLcp - 2500) / 1500) * 40) : Math.max(10, Math.round(50 - ((cwvLcp - 4000) / 4000) * 40)))
-        : 50;
+      let estPerf: number;
+      if (cwvLcp > 0) {
+        // Flag suspiciously fast LCP (likely cached/service-worker/error page)
+        if (cwvLcp < 200) {
+          estPerf = 30; // Unreliable measurement — treat as poor
+          this.logger.warn(`Suspiciously fast CWV LCP=${cwvLcp}ms — likely cached/SW page, using conservative estimate=30`);
+        } else if (cwvLcp <= 2500) {
+          estPerf = 50; // Good LCP but LH failed, so cap at 50
+        } else if (cwvLcp <= 4000) {
+          estPerf = Math.round(50 - ((cwvLcp - 2500) / 1500) * 20); // 50→30
+        } else {
+          estPerf = Math.max(10, Math.round(30 - ((cwvLcp - 4000) / 4000) * 20)); // 30→10
+        }
+      } else {
+        estPerf = 30; // No CWV data at all
+      }
       lighthouseData = {
         performanceScore: estPerf,
         accessibilityScore: 0,
@@ -1043,7 +1058,7 @@ export class PerformanceAgent extends BaseAgent {
         pwaScore: 0,
         estimated: true,
       };
-      this.logger.warn(`Lighthouse failed — estimated performanceScore=${estPerf} from CWV LCP=${cwvLcp}ms for dashboard`);
+      this.logger.warn(`Lighthouse failed — estimated performanceScore=${estPerf} from CWV LCP=${cwvLcp}ms for dashboard (capped — LH failure implies site issues)`);
     }
 
     // ── Core Web Vitals ──
@@ -1144,16 +1159,28 @@ export class PerformanceAgent extends BaseAgent {
     if (primaryLHScore !== null) {
       lighthouseActual = Math.round((primaryLHScore / 100) * 85 * 100) / 100;
     } else {
-      // Lighthouse FAILED — estimate from CWV data if available
+      // Lighthouse FAILED — use conservative estimate.
+      // CWV-only estimation is unreliable: LCP < 200ms usually means cached/SW/error page.
+      // Cap at 50/100 max since LH failure itself signals site complexity issues.
       const cwvLcp = this._cwvValuesMap['desktop']?.lcp?.value || this._cwvValuesMap['mweb']?.lcp?.value || 0;
       const cwvFcp = this._cwvValuesMap['desktop']?.fcp?.value || this._cwvValuesMap['mweb']?.fcp?.value || 0;
       if (cwvLcp > 0 || cwvFcp > 0) {
-        const lcpScore = cwvLcp <= 2500 ? 90 : cwvLcp <= 4000 ? Math.round(90 - ((cwvLcp - 2500) / 1500) * 40) : Math.max(10, Math.round(50 - ((cwvLcp - 4000) / 4000) * 40));
+        let lcpScore: number;
+        if (cwvLcp < 200) {
+          lcpScore = 30; // Suspiciously fast — likely cached/SW page
+          this.logger.warn(`Suspiciously fast CWV LCP=${cwvLcp}ms in scoring — using conservative 30`);
+        } else if (cwvLcp <= 2500) {
+          lcpScore = 50; // Good LCP but LH failed — cap at 50
+        } else if (cwvLcp <= 4000) {
+          lcpScore = Math.round(50 - ((cwvLcp - 2500) / 1500) * 20); // 50→30
+        } else {
+          lcpScore = Math.max(10, Math.round(30 - ((cwvLcp - 4000) / 4000) * 20)); // 30→10
+        }
         lighthouseActual = Math.round((lcpScore / 100) * 85 * 100) / 100;
-        this.logger.warn(`Lighthouse failed — estimated score from CWV LCP (${cwvLcp}ms → ~${lcpScore}/100 → ${lighthouseActual}/85)`);
+        this.logger.warn(`Lighthouse failed — estimated score from CWV LCP (${cwvLcp}ms → ~${lcpScore}/100 → ${lighthouseActual}/85) [capped]`);
       } else {
-        lighthouseActual = 42.5; // 50% default (42.5/85)
-        this.logger.warn('Lighthouse failed and no CWV data available — using 50% default (42.5/85)');
+        lighthouseActual = 25.5; // 30% default (25.5/85) — conservative when LH fails
+        this.logger.warn('Lighthouse failed and no CWV data available — using 30% default (25.5/85)');
       }
     }
     const lighthouseAuditFindings = this.findings.filter((f) => f.category === 'Lighthouse Audit');
