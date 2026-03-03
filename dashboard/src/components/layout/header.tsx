@@ -5,8 +5,9 @@ import { useReportStore, useAuthStore, useScanStore, useQueueStore } from "@/lib
 import { getScoreStatus, timeAgo, cn } from "@/lib/utils";
 import { abortScan, getLatestReport, getScannedUrls, type ScannedUrlEntry } from "@/lib/api";
 import {
-  Bell, User, LogOut, Loader2, Activity, StopCircle, ChevronDown,
+  User, LogOut, Loader2, Activity, StopCircle, ChevronDown,
 } from "lucide-react";
+import { NotificationBell } from "./notification-bell";
 
 export function Header() {
   const { report, setReport } = useReportStore();
@@ -184,14 +185,7 @@ export function Header() {
         </button>
 
         {/* Notifications */}
-        <button className="btn-ghost p-2 relative" aria-label="Notifications">
-          <Bell className="w-4 h-4" />
-          {report && report.criticalFindings.length > 0 && (
-            <span className="absolute -top-0.5 -right-0.5 w-4 h-4 flex items-center justify-center rounded-full bg-red-500 text-[10px] font-bold text-white">
-              {report.criticalFindings.length > 9 ? "9+" : report.criticalFindings.length}
-            </span>
-          )}
-        </button>
+        <NotificationBell />
 
         {/* User menu */}
         {user && (

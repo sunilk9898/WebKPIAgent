@@ -148,6 +148,7 @@ export interface BatchScanEntry {
   status: "queued" | "running" | "completed" | "error";
   score?: number;
   error?: string;
+  progress?: number; // 0-100 from scan:progress events
 }
 
 interface BatchStore {
@@ -156,6 +157,7 @@ interface BatchStore {
   batchRunning: boolean;
   startBatch: (batchId: string, scans: { url: string; scanId: string }[]) => void;
   updateBatchEntry: (scanId: string, updates: Partial<BatchScanEntry>) => void;
+  restartBatchEntry: (oldScanId: string, newScanId: string) => void;
   clearBatch: () => void;
 }
 
@@ -173,6 +175,14 @@ export const useBatchStore = create<BatchStore>((set) => ({
     set((state) => ({
       batchScans: state.batchScans.map((s) =>
         s.scanId === scanId ? { ...s, ...updates } : s,
+      ),
+    })),
+  restartBatchEntry: (oldScanId, newScanId) =>
+    set((state) => ({
+      batchScans: state.batchScans.map((s) =>
+        s.scanId === oldScanId
+          ? { ...s, scanId: newScanId, status: "queued" as const, score: undefined, error: undefined, progress: undefined }
+          : s,
       ),
     })),
   clearBatch: () => set({ batchId: null, batchScans: [], batchRunning: false }),
@@ -255,6 +265,52 @@ export const useToastStore = create<ToastStore>((set) => ({
   },
   removeToast: (id) =>
     set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
+}));
+
+// ---------------------------------------------------------------------------
+// Notification Store (bell dropdown history)
+// ---------------------------------------------------------------------------
+export interface Notification {
+  id: string;
+  type: "scan_complete" | "scan_error" | "scan_started" | "queue_update";
+  title: string;
+  message: string;
+  timestamp: string;
+  read: boolean;
+  url?: string;
+  score?: number;
+}
+
+interface NotificationStore {
+  notifications: Notification[];
+  addNotification: (n: Omit<Notification, "id" | "timestamp" | "read">) => void;
+  markAsRead: (id: string) => void;
+  markAllAsRead: () => void;
+  clearAll: () => void;
+  unreadCount: () => number;
+}
+
+export const useNotificationStore = create<NotificationStore>((set, get) => ({
+  notifications: [],
+  addNotification: (n) => {
+    const id = `notif_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const notification: Notification = { ...n, id, timestamp: new Date().toISOString(), read: false };
+    set((state) => ({
+      notifications: [notification, ...state.notifications].slice(0, 50),
+    }));
+  },
+  markAsRead: (id) =>
+    set((state) => ({
+      notifications: state.notifications.map((n) =>
+        n.id === id ? { ...n, read: true } : n,
+      ),
+    })),
+  markAllAsRead: () =>
+    set((state) => ({
+      notifications: state.notifications.map((n) => ({ ...n, read: true })),
+    })),
+  clearAll: () => set({ notifications: [] }),
+  unreadCount: () => get().notifications.filter((n) => !n.read).length,
 }));
 
 // ---------------------------------------------------------------------------

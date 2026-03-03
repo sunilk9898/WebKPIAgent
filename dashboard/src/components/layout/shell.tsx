@@ -5,7 +5,7 @@ import { Sidebar } from "./sidebar";
 import { Header } from "./header";
 import { GlobalScanStatusBar } from "@/components/shared/global-scan-status-bar";
 import { ToastContainer } from "@/components/shared/toast-container";
-import { useUIStore, useReportStore, useScanStore, useQueueStore, useToastStore } from "@/lib/store";
+import { useUIStore, useReportStore, useScanStore, useQueueStore, useToastStore, useNotificationStore } from "@/lib/store";
 import { getLatestReport, getQueueStatus } from "@/lib/api";
 import { connect, disconnect, onScanComplete, onScanError, onQueueStatus, onScanStarted } from "@/lib/websocket";
 import { cn } from "@/lib/utils";
@@ -63,10 +63,25 @@ export function Shell({ children }: { children: React.ReactNode }) {
         message: url ? `${url} scored ${data.score}/100` : `Scan scored ${data.score}/100`,
         duration: 6000,
       });
+      // Notification bell entry
+      useNotificationStore.getState().addNotification({
+        type: "scan_complete",
+        title: "Scan Complete",
+        message: url ? `${url} scored ${data.score}/100` : `Scan finished with score ${data.score}`,
+        url,
+        score: data.score,
+      });
     });
 
-    const unsubError = onScanError(() => {
+    const unsubError = onScanError((data) => {
       setActiveScan(null);
+      // Notification bell entry for errors
+      useNotificationStore.getState().addNotification({
+        type: "scan_error",
+        title: "Scan Failed",
+        message: (data as any).error || "An error occurred during the scan",
+        url: (data as any).url,
+      });
     });
 
     // Queue status broadcasts (all users see this)
@@ -81,6 +96,13 @@ export function Shell({ children }: { children: React.ReactNode }) {
         title: "Scan Started",
         message: `Your scan for ${data.url} has started.`,
         duration: 4000,
+      });
+      // Notification bell entry
+      useNotificationStore.getState().addNotification({
+        type: "scan_started",
+        title: "Scan Started",
+        message: `Scan for ${data.url} has started processing.`,
+        url: data.url,
       });
     });
 

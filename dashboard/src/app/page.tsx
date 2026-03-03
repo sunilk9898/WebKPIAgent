@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import {
   Shield, Gauge, Code2, AlertTriangle, TrendingUp, TrendingDown, Minus,
   Clock, BarChart3, ArrowRight, Loader2, CheckCircle2, XCircle, List, StopCircle,
+  RefreshCw,
 } from "lucide-react";
 import Link from "next/link";
 import { KPIGauge } from "@/components/charts/kpi-gauge";
@@ -15,12 +16,12 @@ import { RegressionBanner } from "@/components/cards/regression-banner";
 import { FindingRow } from "@/components/cards/finding-row";
 import { ScanInput } from "@/components/shared/scan-input";
 import { useScanReport } from "@/hooks/use-scan-report";
-import { getTrends, triggerBatchScan, getLatestReport, abortScan, type TrendPoint } from "@/lib/api";
+import { getTrends, triggerBatchScan, triggerScan, getLatestReport, abortScan, type TrendPoint } from "@/lib/api";
 import { AIRecommendationsPanel } from "@/components/panels/ai-recommendations-panel";
 import { ExecutiveSummary } from "@/components/shared/executive-summary";
 import { cn, timeAgo, getScoreStatus } from "@/lib/utils";
-import { useUIStore, useBatchStore, useReportStore, useScanStore, type BatchScanEntry } from "@/lib/store";
-import { onBatchProgress, onBatchComplete } from "@/lib/websocket";
+import { useUIStore, useBatchStore, useReportStore, useScanStore, useAuthStore, type BatchScanEntry } from "@/lib/store";
+import { onBatchProgress, onBatchComplete, onScanProgress } from "@/lib/websocket";
 
 export default function OverviewPage() {
   const {
@@ -90,9 +91,18 @@ export default function OverviewPage() {
         loadReportForUrl(completed.url);
       }
     });
+    // Listen for per-scan progress to update batch entry progress field
+    const unsubScanProgress = onScanProgress((data) => {
+      const batchEntries = useBatchStore.getState().batchScans;
+      const match = batchEntries.find((s) => s.scanId === data.scanId);
+      if (match) {
+        useBatchStore.getState().updateBatchEntry(data.scanId, { progress: data.progress });
+      }
+    });
     return () => {
       unsubProgress();
       unsubComplete();
+      unsubScanProgress();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [updateBatchEntry]);
@@ -442,6 +452,38 @@ function BatchProgressPanel({
   const completed = batchScans.filter((s) => s.status === "completed").length;
   const errors = batchScans.filter((s) => s.status === "error").length;
   const total = batchScans.length;
+  const pct = total > 0 ? Math.round(((completed + errors) / total) * 100) : 0;
+  const isAdmin = useAuthStore((s) => s.hasRole(["admin", "devops"]));
+  const { restartBatchEntry } = useBatchStore();
+  const [actionLoading, setActionLoading] = useState<Record<string, "cancel" | "restart" | null>>({});
+
+  const handleCancel = async (e: React.MouseEvent, scanId: string) => {
+    e.stopPropagation();
+    if (actionLoading[scanId]) return;
+    setActionLoading((prev) => ({ ...prev, [scanId]: "cancel" }));
+    try {
+      await abortScan(scanId);
+      useBatchStore.getState().updateBatchEntry(scanId, { status: "error", error: "Cancelled by admin" });
+    } catch (err: any) {
+      console.warn("Cancel failed:", err.message);
+    } finally {
+      setActionLoading((prev) => ({ ...prev, [scanId]: null }));
+    }
+  };
+
+  const handleRestart = async (e: React.MouseEvent, scan: BatchScanEntry) => {
+    e.stopPropagation();
+    if (actionLoading[scan.scanId]) return;
+    setActionLoading((prev) => ({ ...prev, [scan.scanId]: "restart" }));
+    try {
+      const res = await triggerScan({ url: scan.url, platform: "both", agents: ["security", "performance", "code-quality"] });
+      restartBatchEntry(scan.scanId, res.scanId);
+    } catch (err: any) {
+      console.warn("Restart failed:", err.message);
+    } finally {
+      setActionLoading((prev) => ({ ...prev, [scan.scanId]: null }));
+    }
+  };
 
   return (
     <div className="card mt-6">
@@ -462,11 +504,12 @@ function BatchProgressPanel({
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
+          <span className="text-xs font-semibold text-gray-300 tabular-nums w-8 text-right">{pct}%</span>
           <div className="w-32 h-1.5 bg-surface-4 rounded-full overflow-hidden">
             <div
               className="h-full bg-brand-500 rounded-full transition-all duration-500"
-              style={{ width: `${total > 0 ? ((completed + errors) / total) * 100 : 0}%` }}
+              style={{ width: `${pct}%` }}
             />
           </div>
           {!batchRunning && (
@@ -505,6 +548,10 @@ function BatchProgressPanel({
                 {isActive && <span className="text-[9px] text-brand-400 font-medium ml-1">Active</span>}
               </div>
               <div className="flex items-center gap-3 shrink-0 ml-3">
+                {/* Per-scan progress for running scans */}
+                {scan.status === "running" && scan.progress !== undefined && (
+                  <span className="text-[10px] font-medium text-brand-400 tabular-nums">{scan.progress}%</span>
+                )}
                 {scan.score !== undefined && (
                   <span className={cn(
                     "text-sm font-bold",
@@ -522,6 +569,37 @@ function BatchProgressPanel({
                 )}>
                   {scan.status === "completed" ? "Done" : scan.status === "running" ? "Scanning" : scan.status === "error" ? "Failed" : "Queued"}
                 </span>
+
+                {/* Admin cancel/restart controls */}
+                {isAdmin && (scan.status === "running" || scan.status === "queued") && (
+                  <button
+                    onClick={(e) => handleCancel(e, scan.scanId)}
+                    disabled={!!actionLoading[scan.scanId]}
+                    title="Cancel scan"
+                    className="p-1 rounded hover:bg-red-500/15 text-gray-500 hover:text-red-400 transition-colors disabled:opacity-50"
+                  >
+                    {actionLoading[scan.scanId] === "cancel" ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <StopCircle className="w-3.5 h-3.5" />
+                    )}
+                  </button>
+                )}
+                {isAdmin && (scan.status === "completed" || scan.status === "error") && (
+                  <button
+                    onClick={(e) => handleRestart(e, scan)}
+                    disabled={!!actionLoading[scan.scanId]}
+                    title="Restart scan"
+                    className="p-1 rounded hover:bg-brand-500/15 text-gray-500 hover:text-brand-400 transition-colors disabled:opacity-50"
+                  >
+                    {actionLoading[scan.scanId] === "restart" ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    )}
+                  </button>
+                )}
+
                 {isClickable && (
                   <ArrowRight className="w-3 h-3 text-gray-500" />
                 )}
