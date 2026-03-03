@@ -190,8 +190,29 @@ export class PerformanceAgent extends BaseAgent {
     }
   }
 
+  /**
+   * Resolve redirects to get the final URL.
+   * This prevents Lighthouse LanternError caused by client-side or server-side
+   * redirects creating multiple navigations in the trace (e.g. vzy.one → vzy.one/en).
+   * The trace engine cannot map metric scores when two navigations exist.
+   */
+  private async resolveRedirects(url: string): Promise<string> {
+    try {
+      const resp = await fetch(url, { method: 'HEAD', redirect: 'follow' });
+      const finalUrl = resp.url;
+      if (finalUrl && finalUrl !== url) {
+        this.logger.info(`Resolved redirect: ${url} → ${finalUrl}`);
+        return finalUrl;
+      }
+    } catch (e) {
+      this.logger.warn('Redirect resolution failed, using original URL', { error: String(e) });
+    }
+    return url;
+  }
+
   protected async scan(config: ScanConfig): Promise<void> {
-    const url = config.target.url!;
+    // Resolve redirects before scanning to prevent LanternError from double-navigation traces
+    const url = await this.resolveRedirects(config.target.url!);
     const platforms: Platform[] = config.platform === 'both' ? ['desktop', 'mweb'] : [config.platform];
 
     // Platform-specific analyses (Lighthouse, CWV, Player)
