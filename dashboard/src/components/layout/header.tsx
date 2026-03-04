@@ -5,9 +5,10 @@ import { useReportStore, useAuthStore, useScanStore, useQueueStore } from "@/lib
 import { getScoreStatus, timeAgo, cn } from "@/lib/utils";
 import { abortScan, getLatestReport, getScannedUrls, type ScannedUrlEntry } from "@/lib/api";
 import {
-  User, LogOut, Loader2, Activity, StopCircle, ChevronDown,
+  User, LogOut, Loader2, StopCircle, ChevronDown,
 } from "lucide-react";
 import { NotificationBell } from "./notification-bell";
+import { SystemHealthPanel } from "./system-health-panel";
 
 export function Header() {
   const { report, setReport } = useReportStore();
@@ -179,10 +180,7 @@ export function Header() {
       {/* Right: notifications + user */}
       <div className="flex items-center gap-3">
         {/* System health indicator */}
-        <button className="btn-ghost p-2 relative" aria-label="System health">
-          <Activity className="w-4 h-4" />
-          <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-kpi-pass" />
-        </button>
+        <SystemHealthPanel />
 
         {/* Notifications */}
         <NotificationBell />
