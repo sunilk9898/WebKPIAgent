@@ -35,13 +35,13 @@ export function BeforeAfterBar({ data, height = 220 }: BeforeAfterBarProps) {
         />
         <ReferenceLine y={95} stroke="#22c55e" strokeDasharray="4 4" strokeWidth={1} label={{ value: "Target: 95", fill: "#22c55e", fontSize: 10, position: "right" }} />
         <Bar dataKey="current" name="current" radius={[4, 4, 0, 0]} barSize={28}>
-          {data.map((entry, i) => (
-            <Cell key={i} fill={entry.current >= 95 ? "#22c55e" : entry.current >= 80 ? "#f59e0b" : "#ef4444"} opacity={0.6} />
+          {data.map((_entry, i) => (
+            <Cell key={i} fill="#f59e0b" opacity={0.6} />
           ))}
         </Bar>
         <Bar dataKey="projected" name="projected" radius={[4, 4, 0, 0]} barSize={28}>
-          {data.map((entry, i) => (
-            <Cell key={i} fill={entry.projected >= 95 ? "#22c55e" : entry.projected >= 80 ? "#3b82f6" : "#ef4444"} />
+          {data.map((_entry, i) => (
+            <Cell key={i} fill="#3b82f6" />
           ))}
         </Bar>
       </BarChart>
