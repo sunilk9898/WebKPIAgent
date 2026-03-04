@@ -2,18 +2,22 @@
 
 import { useState } from "react";
 import {
-  FileJson, FileText, Download, Share2, Calendar,
-  TrendingUp, TrendingDown, ArrowRight, Copy, Check, Link2,
+  FileJson, FileText, Share2,
+  TrendingDown, ArrowRight, Copy, Check,
   Code2, Briefcase, Loader2, Sparkles, RefreshCw, FileDown,
+  Presentation, GitBranch, BarChart3,
 } from "lucide-react";
 import { TrendChart } from "@/components/charts/trend-chart";
+import { MindMap } from "@/components/charts/mind-map";
 import { useScanReport } from "@/hooks/use-scan-report";
 import { generateReport, type GeneratedReport } from "@/lib/api";
 import { cn, timeAgo, getScoreColor, getSeverityBg } from "@/lib/utils";
-import { generateManagementPDF, generateDeveloperPDF, generateFullPDF } from "@/lib/pdf-generator";
+import { generateManagementPDF, generateDeveloperPDF } from "@/lib/pdf-generator";
+import { generatePerformanceAuditPDF } from "@/lib/audit-pdf-generator";
+import { generatePlatformAnalysisPPTX } from "@/lib/pptx-generator";
 import { ExecutiveSummary } from "@/components/shared/executive-summary";
 
-type ReportMode = "overview" | "management" | "developer";
+type ReportMode = "overview" | "management" | "developer" | "mindmap";
 
 export default function ReportingPage() {
   const { report } = useScanReport();
@@ -49,6 +53,36 @@ export default function ReportingPage() {
     a.download = `vzy-scan-${report.scanId}.json`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  // Download Performance Audit PDF (replaces old Full Report PDF)
+  const handleDownloadAuditPDF = async () => {
+    if (!report) return;
+    setPdfGenerating("audit");
+    try {
+      let aiContent = mgmtReport?.content;
+      if (!aiContent) {
+        try {
+          const result = await generateReport(report.scanId, "management");
+          setMgmtReport(result);
+          aiContent = result.content;
+        } catch { /* proceed without AI content */ }
+      }
+      generatePerformanceAuditPDF(report, aiContent);
+    } finally {
+      setPdfGenerating(null);
+    }
+  };
+
+  // Download Platform Analysis PPTX
+  const handleDownloadPPTX = async () => {
+    if (!report) return;
+    setPdfGenerating("pptx");
+    try {
+      await generatePlatformAnalysisPPTX(report);
+    } finally {
+      setPdfGenerating(null);
+    }
   };
 
   // Download Management PDF
@@ -89,24 +123,6 @@ export default function ReportingPage() {
     }
   };
 
-  // Download Complete Comprehensive PDF
-  const handleDownloadFullPDF = async () => {
-    if (!report) return;
-    setPdfGenerating("full");
-    try {
-      // Fetch both AI reports in parallel if not already cached
-      const [mgmt, dev] = await Promise.all([
-        mgmtReport ? Promise.resolve(mgmtReport) : generateReport(report.scanId, "management").catch(() => null),
-        devReport ? Promise.resolve(devReport) : generateReport(report.scanId, "developer").catch(() => null),
-      ]);
-      if (mgmt) setMgmtReport(mgmt);
-      if (dev) setDevReport(dev);
-      generateFullPDF(report, undefined, mgmt?.content, dev?.content);
-    } finally {
-      setPdfGenerating(null);
-    }
-  };
-
   // Copy share link
   const handleShare = async () => {
     const shareUrl = `${window.location.origin}/reports/${report.scanId}`;
@@ -122,7 +138,6 @@ export default function ReportingPage() {
     try {
       const result = await generateReport(report.scanId, mode);
       setGeneratedReport(result);
-      // Cache for PDF generation
       if (mode === "management") setMgmtReport(result);
       else setDevReport(result);
     } catch (err: any) {
@@ -135,29 +150,24 @@ export default function ReportingPage() {
   // Switch mode tab
   const handleModeSwitch = (mode: ReportMode) => {
     setActiveMode(mode);
-    if (mode !== "overview" && (!generatedReport || generatedReport.mode !== mode)) {
-      handleGenerate(mode);
+    if (mode === "management" || mode === "developer") {
+      if (!generatedReport || generatedReport.mode !== mode) {
+        handleGenerate(mode);
+      }
     }
   };
 
   return (
     <div className="space-y-6 max-w-[1200px] mx-auto">
+      {/* ── Page Header with Download Buttons ── */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-bold text-gray-100">Reporting</h1>
-          <p className="text-sm text-gray-500">Download, compare, and share scan reports</p>
+          <p className="text-sm text-gray-500">Generate, download, and share scan reports</p>
         </div>
         <div className="flex gap-2 flex-wrap justify-end">
           <button onClick={handleDownloadJSON} className="btn-secondary text-xs">
             <FileJson className="w-4 h-4" /> JSON
-          </button>
-          <button
-            onClick={handleDownloadFullPDF}
-            disabled={pdfGenerating === "full"}
-            className="btn-primary text-xs"
-          >
-            {pdfGenerating === "full" ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileDown className="w-4 h-4" />}
-            {pdfGenerating === "full" ? "Generating..." : "Full Report PDF"}
           </button>
           <button onClick={handleShare} className="btn-secondary text-xs">
             {copied ? <Check className="w-4 h-4" /> : <Share2 className="w-4 h-4" />}
@@ -166,12 +176,120 @@ export default function ReportingPage() {
         </div>
       </div>
 
+      {/* ── Download Cards Row ── */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        {/* Performance Audit PDF */}
+        <button
+          onClick={handleDownloadAuditPDF}
+          disabled={pdfGenerating === "audit"}
+          className="card p-4 text-left hover:border-brand-500/30 hover:bg-white/[0.02] transition-all group"
+        >
+          <div className="flex items-center gap-3 mb-2">
+            <div className="p-2 rounded-lg bg-red-500/15">
+              <BarChart3 className="w-4 h-4 text-red-400" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-xs font-semibold text-gray-200 group-hover:text-brand-300 transition-colors">
+                Performance Audit Report
+              </div>
+              <div className="text-[10px] text-gray-500">PDF • 6-Section Technical Analysis</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 text-[10px] text-gray-500">
+            {pdfGenerating === "audit" ? (
+              <><Loader2 className="w-3 h-3 animate-spin" /> Generating...</>
+            ) : (
+              <><FileDown className="w-3 h-3" /> Click to generate &amp; download</>
+            )}
+          </div>
+        </button>
+
+        {/* Platform Analysis PPTX */}
+        <button
+          onClick={handleDownloadPPTX}
+          disabled={pdfGenerating === "pptx"}
+          className="card p-4 text-left hover:border-brand-500/30 hover:bg-white/[0.02] transition-all group"
+        >
+          <div className="flex items-center gap-3 mb-2">
+            <div className="p-2 rounded-lg bg-amber-500/15">
+              <Presentation className="w-4 h-4 text-amber-400" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-xs font-semibold text-gray-200 group-hover:text-brand-300 transition-colors">
+                VZY Platform Analysis Slide
+              </div>
+              <div className="text-[10px] text-gray-500">PPTX • 14-Slide Presentation</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 text-[10px] text-gray-500">
+            {pdfGenerating === "pptx" ? (
+              <><Loader2 className="w-3 h-3 animate-spin" /> Generating...</>
+            ) : (
+              <><FileDown className="w-3 h-3" /> Click to generate &amp; download</>
+            )}
+          </div>
+        </button>
+
+        {/* Management PDF */}
+        <button
+          onClick={handleDownloadManagementPDF}
+          disabled={pdfGenerating === "management"}
+          className="card p-4 text-left hover:border-brand-500/30 hover:bg-white/[0.02] transition-all group"
+        >
+          <div className="flex items-center gap-3 mb-2">
+            <div className="p-2 rounded-lg bg-purple-500/15">
+              <Briefcase className="w-4 h-4 text-purple-400" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-xs font-semibold text-gray-200 group-hover:text-brand-300 transition-colors">
+                Management Report
+              </div>
+              <div className="text-[10px] text-gray-500">PDF • Executive Risk Assessment</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 text-[10px] text-gray-500">
+            {pdfGenerating === "management" ? (
+              <><Loader2 className="w-3 h-3 animate-spin" /> Generating...</>
+            ) : (
+              <><FileDown className="w-3 h-3" /> Click to generate &amp; download</>
+            )}
+          </div>
+        </button>
+
+        {/* Developer PDF */}
+        <button
+          onClick={handleDownloadDeveloperPDF}
+          disabled={pdfGenerating === "developer"}
+          className="card p-4 text-left hover:border-brand-500/30 hover:bg-white/[0.02] transition-all group"
+        >
+          <div className="flex items-center gap-3 mb-2">
+            <div className="p-2 rounded-lg bg-blue-500/15">
+              <Code2 className="w-4 h-4 text-blue-400" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="text-xs font-semibold text-gray-200 group-hover:text-brand-300 transition-colors">
+                Developer Report
+              </div>
+              <div className="text-[10px] text-gray-500">PDF • Technical Deep-Dive</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 text-[10px] text-gray-500">
+            {pdfGenerating === "developer" ? (
+              <><Loader2 className="w-3 h-3 animate-spin" /> Generating...</>
+            ) : (
+              <><FileDown className="w-3 h-3" /> Click to generate &amp; download</>
+            )}
+          </div>
+        </button>
+      </div>
+
       {/* ── Mode Tabs ── */}
       <div className="flex items-center gap-1 p-1 rounded-xl bg-surface-1 border border-white/[0.06] w-fit">
         {([
           { key: "overview" as ReportMode, label: "Overview", icon: FileText },
           { key: "management" as ReportMode, label: "Management", icon: Briefcase },
           { key: "developer" as ReportMode, label: "Developer", icon: Code2 },
+          { key: "mindmap" as ReportMode, label: "Mind Map", icon: GitBranch },
         ]).map(({ key, label, icon: Icon }) => (
           <button
             key={key}
@@ -368,7 +486,25 @@ export default function ReportingPage() {
         />
       )}
 
-      {/* PDF generation replaces browser print */}
+      {/* ── Mind Map Mode ── */}
+      {activeMode === "mindmap" && (
+        <div className="space-y-4">
+          <div className="card p-5">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 rounded-lg bg-green-500/15">
+                <GitBranch className="w-5 h-5 text-green-400" />
+              </div>
+              <div>
+                <h2 className="text-sm font-bold text-gray-100">Mind Map Visualization</h2>
+                <p className="text-xs text-gray-500">
+                  Interactive hierarchical view of the entire scan report — click nodes to expand/collapse
+                </p>
+              </div>
+            </div>
+          </div>
+          <MindMap report={report} />
+        </div>
+      )}
     </div>
   );
 }
