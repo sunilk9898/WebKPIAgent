@@ -1214,6 +1214,89 @@ app.post('/api/reports/:scanId/generate', authMiddleware as any, requireRole('ad
       });
     }
 
+    // Validate OpenAI key is not a placeholder
+    const isPlaceholderKey = !process.env.OPENAI_API_KEY ||
+      process.env.OPENAI_API_KEY.includes('PLACEHOLDER') ||
+      process.env.OPENAI_API_KEY.includes('your-') ||
+      process.env.OPENAI_API_KEY.length < 20;
+
+    if (isPlaceholderKey) {
+      // Return same fallback as when openai is null
+      const overallScore = reportData.kpiScore?.overallScore ?? reportData.overallScore ?? 'N/A';
+      const securityScore = reportData.kpiScore?.grades?.security?.rawScore ?? reportData.securityScore ?? 'N/A';
+      const performanceScore = reportData.kpiScore?.grades?.performance?.rawScore ?? reportData.performanceScore ?? 'N/A';
+      const codeQualityScore = reportData.kpiScore?.grades?.codeQuality?.rawScore ?? reportData.codeQualityScore ?? 'N/A';
+      const findings = reportData.criticalFindings || [];
+      const recommendations = reportData.recommendations || [];
+      const enhanced = reportData.enhancedRecommendations || [];
+      const regressions = reportData.kpiScore?.regressions || [];
+
+      const fallbackContent = mode === 'management'
+        ? `# Executive Risk Posture Report\n\n` +
+          `## Overall Platform Health\n\n` +
+          `| Metric | Score | Status |\n|--------|-------|--------|\n` +
+          `| **Overall KPI** | **${overallScore}/100** | ${Number(overallScore) >= 95 ? '✅ PASS' : '❌ FAIL'} |\n` +
+          `| Security (40%) | ${securityScore}/100 | ${Number(securityScore) >= 80 ? '🟢' : Number(securityScore) >= 60 ? '🟡' : '🔴'} |\n` +
+          `| Performance (35%) | ${performanceScore}/100 | ${Number(performanceScore) >= 80 ? '🟢' : Number(performanceScore) >= 60 ? '🟡' : '🔴'} |\n` +
+          `| Code Quality (25%) | ${codeQualityScore}/100 | ${Number(codeQualityScore) >= 80 ? '🟢' : Number(codeQualityScore) >= 60 ? '🟡' : '🔴'} |\n\n` +
+          `## Risk Assessment\n\n` +
+          `**Critical Findings:** ${findings.length}\n` +
+          `**Regressions:** ${regressions.length}\n\n` +
+          (Number(securityScore) < 70 ? '- **[CRITICAL RISK]** Security score below acceptable threshold. Immediate remediation required.\n' : '') +
+          (Number(performanceScore) < 70 ? '- **[HIGH RISK]** Performance degradation detected. User experience may be impacted.\n' : '') +
+          (Number(codeQualityScore) < 70 ? '- **[MEDIUM RISK]** Code quality issues may increase maintenance costs.\n' : '') +
+          `\n## Critical Issues Requiring Attention\n\n` +
+          findings.slice(0, 10).map((f: any, i: number) => `${i + 1}. **[${(f.severity || 'info').toUpperCase()}]** ${f.title || f.description || f}${f.remediation ? `\n   - *Remediation:* ${f.remediation.substring(0, 150)}` : ''}`).join('\n') +
+          `\n\n## Top Recommendations\n\n` +
+          (enhanced.length > 0
+            ? enhanced.slice(0, 8).map((r: any, i: number) => `${i + 1}. **${r.title}** — Impact: ${r.impactScore || 'N/A'}, Effort: ${r.effort || 'N/A'}, Projected Gain: +${(r.projectedScoreGain || 0).toFixed?.(1) ?? r.projectedScoreGain} pts`).join('\n')
+            : recommendations.slice(0, 8).map((r: any, i: number) => `${i + 1}. ${r.title || r}`).join('\n')) +
+          `\n\n---\n*Report generated from scan data. Configure a valid OPENAI_API_KEY for AI-enhanced executive analysis.*`
+        : `# Developer Technical Report\n\n` +
+          `## Score Summary\n\n` +
+          `| Pillar | Score | Weight |\n|--------|-------|--------|\n` +
+          `| **Overall** | **${overallScore}/100** | — |\n` +
+          `| Security | ${securityScore}/100 | 40% |\n` +
+          `| Performance | ${performanceScore}/100 | 35% |\n` +
+          `| Code Quality | ${codeQualityScore}/100 | 25% |\n\n` +
+          `## Critical & High Findings (${findings.length} total)\n\n` +
+          findings.slice(0, 20).map((f: any, i: number) => {
+            const parts = [`${i + 1}. **[${(f.severity || 'info').toUpperCase()}]** ${f.title || f.description || f}`];
+            if (f.category) parts.push(`   - Category: ${f.category}`);
+            if (f.evidence) parts.push(`   - Evidence: \`${f.evidence.substring(0, 120)}\``);
+            if (f.remediation) parts.push(`   - Fix: ${f.remediation.substring(0, 200)}`);
+            if (f.agent) parts.push(`   - Agent: ${f.agent}`);
+            return parts.join('\n');
+          }).join('\n') +
+          `\n\n## Remediation Roadmap\n\n` +
+          (enhanced.length > 0
+            ? enhanced.sort((a: any, b: any) => (b.projectedScoreGain || 0) - (a.projectedScoreGain || 0)).slice(0, 10).map((r: any, i: number) => {
+                const parts = [`${i + 1}. **${r.title}**`];
+                parts.push(`   - Impact Score: ${r.impactScore || 'N/A'} | Effort: ${r.effort || 'N/A'} | Gain: +${(r.projectedScoreGain || 0).toFixed?.(1) ?? r.projectedScoreGain} pts`);
+                if (r.quickWin) parts.push(`   - ⚡ **Quick Win**`);
+                if (r.description) parts.push(`   - ${r.description.substring(0, 150)}`);
+                return parts.join('\n');
+              }).join('\n')
+            : recommendations.slice(0, 10).map((r: any, i: number) => {
+                const parts = [`${i + 1}. **${r.title || r}**`];
+                if (r.priority) parts.push(`   - Priority: ${r.priority}`);
+                if (r.impact) parts.push(`   - Impact: ${r.impact}`);
+                return parts.join('\n');
+              }).join('\n')) +
+          (regressions.length > 0
+            ? `\n\n## Regressions (${regressions.length})\n\n` +
+              regressions.slice(0, 10).map((r: any, i: number) => `${i + 1}. **${r.metric}**: ${r.previousValue?.toFixed?.(1) ?? r.previousValue} → ${r.currentValue?.toFixed?.(1) ?? r.currentValue} (Δ ${r.delta >= 0 ? '+' : ''}${r.delta?.toFixed?.(1) ?? r.delta})`).join('\n')
+            : '') +
+          `\n\n---\n*Report generated from scan data. Configure a valid OPENAI_API_KEY for AI-enhanced developer analysis.*`;
+
+      return res.json({
+        content: fallbackContent,
+        mode,
+        scanId,
+        generatedAt: new Date().toISOString(),
+      });
+    }
+
     // Build a condensed report summary to stay within token limits
     const condensed = {
       target: reportData.target,

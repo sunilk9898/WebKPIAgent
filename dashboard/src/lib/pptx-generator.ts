@@ -209,30 +209,61 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
     background: { fill: DARK.bg },
   });
 
+  // Safe string helper - converts any value to a string, defaulting to fallback
+  const str = (val: unknown, fallback = "N/A"): string => {
+    if (val === null || val === undefined) return fallback;
+    if (typeof val === "number" && isNaN(val)) return fallback;
+    return String(val);
+  };
+
+  // Safe number helper - converts any value to number, defaulting to 0
+  const num = (val: unknown, fallback = 0): number => {
+    if (val === null || val === undefined) return fallback;
+    const n = Number(val);
+    return isNaN(n) ? fallback : n;
+  };
+
+  // Safe toFixed
+  const fix = (val: unknown, digits = 1): string => {
+    return num(val).toFixed(digits);
+  };
+
+  // Safe array helper
+  const arr = <T>(val: T[] | null | undefined): T[] => {
+    return Array.isArray(val) ? val : [];
+  };
+
   // Extract agent metadata
-  const perfResult = report.agentResults.find(a => a.agentType === "performance");
-  const secResult = report.agentResults.find(a => a.agentType === "security");
-  const cqResult = report.agentResults.find(a => a.agentType === "code-quality");
+  const perfResult = report.agentResults?.find(a => a.agentType === "performance");
+  const secResult = report.agentResults?.find(a => a.agentType === "security");
+  const cqResult = report.agentResults?.find(a => a.agentType === "code-quality");
 
   const perfMeta = (perfResult?.metadata ?? {}) as Partial<PerformanceMetadata>;
   const secMeta = (secResult?.metadata ?? {}) as Partial<SecurityMetadata>;
   const cqMeta = (cqResult?.metadata ?? {}) as Partial<CodeQualityMetadata>;
 
   const kpi = report.kpiScore;
-  const enhanced = report.enhancedRecommendations || [];
+  if (!kpi || !kpi.grades) {
+    throw new Error("Report is missing kpiScore data. Please ensure the scan completed successfully.");
+  }
+  const enhanced = arr(report.enhancedRecommendations);
   const comparison = report.comparisonWithPrevious;
-  const criticals = report.criticalFindings || [];
-  const allFindings = report.agentResults.flatMap(a => a.findings);
+  const criticals = arr(report.criticalFindings);
+  const allFindings = arr(report.agentResults)?.flatMap(a => arr(a.findings)) ?? [];
 
   const critCount = allFindings.filter(f => f.severity === "critical").length;
   const highCount = allFindings.filter(f => f.severity === "high").length;
-  const dateStr = new Date(report.generatedAt).toLocaleDateString("en-US", {
+  const dateStr = new Date(report.generatedAt || Date.now()).toLocaleDateString("en-US", {
     year: "numeric", month: "long", day: "numeric",
   });
+
+  // Track slide errors for debugging
+  const slideErrors: string[] = [];
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 1 - Title Slide
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide1 = pptx.addSlide({ masterName: "VZY_DARK" });
 
   // Accent stripe at top
@@ -289,10 +320,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
     fontSize: 9, color: DARK.textMuted,
     fontFace: "Helvetica", align: "right",
   });
+  } catch (e) {
+    slideErrors.push(`Slide 1: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 1 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 2 - Overall Score Dashboard
   // ════════════════════════════════════════════════════════════════
+  try {
   const passTitle = kpi.passesThreshold
     ? "Platform Health Meets Target"
     : "Current Platform Health Fails Threshold";
@@ -356,10 +392,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       });
     });
   });
+  } catch (e) {
+    slideErrors.push(`Slide 2: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 2 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 3 - Executive Threat and Trend Briefing
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide3 = addDarkSlide(pptx, "Executive Threat & Trend Briefing", 3);
 
   // Top KPI row
@@ -442,10 +483,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
     x: 8.83, y: 5.45, w: 3.8, h: 0.3,
     fontSize: 9, color: DARK.textMuted, fontFace: "Helvetica",
   });
+  } catch (e) {
+    slideErrors.push(`Slide 3: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 3 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 4 - Security: OWASP & Critical Vulnerabilities
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide4 = addDarkSlide(pptx, "Security: OWASP & Critical Vulnerabilities", 4);
 
   // Security score badge
@@ -474,7 +520,7 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       { text: o.category, options: { fontSize: 7, color: DARK.text, fill: { color: DARK.card } } },
       { text: o.name, options: { fontSize: 7, color: DARK.text, fill: { color: DARK.card } } },
       { text: o.risk.toUpperCase(), options: { fontSize: 7, color: severityColor(o.risk), fill: { color: DARK.card }, align: "center" as const, bold: true } },
-      { text: o.details.slice(0, 80), options: { fontSize: 7, color: DARK.textMuted, fill: { color: DARK.card } } },
+      { text: (o.details || '').slice(0, 80), options: { fontSize: 7, color: DARK.textMuted, fill: { color: DARK.card } } },
     ]);
 
     slide4.addTable([owaspHeader, ...owaspRows], {
@@ -522,10 +568,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       fontSize: 10, color: DARK.green, fontFace: "Helvetica",
     });
   }
+  } catch (e) {
+    slideErrors.push(`Slide 4: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 4 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 5 - Security: API and Token Risks
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide5 = addDarkSlide(pptx, "Security: API & Token Risks", 5);
 
   // API Exposure
@@ -586,7 +637,7 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
     fontFace: "Helvetica", align: "center",
   });
   tokenLeaks.slice(0, 3).forEach((t, i) => {
-    slide5.addText(`${t.type} @ ${t.location.slice(0, 30)}`, {
+    slide5.addText(`${t.type ?? 'unknown'} @ ${(t.location ?? '').slice(0, 30)}`, {
       x: 9.53, y: 2.4 + i * 0.25, w: 3.1, h: 0.2,
       fontSize: 7, color: DARK.textMuted, fontFace: "Helvetica",
     });
@@ -607,13 +658,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       x: 0.7, y: 4.55, w: 3.6, h: 0.25,
       fontSize: 9, color: darkScoreColor(headerMeta.score), fontFace: "Helvetica", bold: true,
     });
-    slide5.addText(`Missing: ${headerMeta.missing.slice(0, 5).join(", ")}`, {
+    const missingHeaders = headerMeta.missing ?? [];
+    slide5.addText(`Missing: ${missingHeaders.slice(0, 5).join(", ")}`, {
       x: 0.7, y: 4.85, w: 3.6, h: 0.5,
       fontSize: 7, color: DARK.textMuted, fontFace: "Helvetica", wrap: true,
     });
-    slide5.addText(`Misconfigured: ${headerMeta.misconfigured.length}`, {
+    const misconfiguredHeaders = headerMeta.misconfigured ?? [];
+    slide5.addText(`Misconfigured: ${misconfiguredHeaders.length}`, {
       x: 0.7, y: 5.4, w: 3.6, h: 0.25,
-      fontSize: 8, color: headerMeta.misconfigured.length > 0 ? DARK.amber : DARK.green, fontFace: "Helvetica",
+      fontSize: 8, color: misconfiguredHeaders.length > 0 ? DARK.amber : DARK.green, fontFace: "Helvetica",
     });
   }
 
@@ -623,11 +676,12 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
     fontSize: 10, bold: true, color: DARK.blue, fontFace: "Helvetica",
   });
   if (sslMeta) {
-    slide5.addText(`Grade: ${sslMeta.grade}`, {
+    const sslGrade = sslMeta.grade ?? 'N/A';
+    slide5.addText(`Grade: ${sslGrade}`, {
       x: 5.03, y: 4.55, w: 3.6, h: 0.25,
-      fontSize: 11, bold: true, color: sslMeta.grade === "A" || sslMeta.grade === "A+" ? DARK.green : DARK.amber, fontFace: "Helvetica",
+      fontSize: 11, bold: true, color: sslGrade === "A" || sslGrade === "A+" ? DARK.green : DARK.amber, fontFace: "Helvetica",
     });
-    slide5.addText(`Protocol: ${sslMeta.protocol}`, {
+    slide5.addText(`Protocol: ${sslMeta.protocol ?? 'N/A'}`, {
       x: 5.03, y: 4.85, w: 3.6, h: 0.25,
       fontSize: 8, color: DARK.textMuted, fontFace: "Helvetica",
     });
@@ -635,9 +689,10 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       x: 5.03, y: 5.1, w: 3.6, h: 0.25,
       fontSize: 8, color: sslMeta.hsts ? DARK.green : DARK.red, fontFace: "Helvetica",
     });
-    slide5.addText(`Issues: ${sslMeta.issues.length}`, {
+    const sslIssues = sslMeta.issues ?? [];
+    slide5.addText(`Issues: ${sslIssues.length}`, {
       x: 5.03, y: 5.35, w: 3.6, h: 0.25,
-      fontSize: 8, color: sslMeta.issues.length > 0 ? DARK.amber : DARK.green, fontFace: "Helvetica",
+      fontSize: 8, color: sslIssues.length > 0 ? DARK.amber : DARK.green, fontFace: "Helvetica",
     });
   }
 
@@ -655,15 +710,21 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       x: 9.36, y: 4.85, w: 3.27, h: 0.25,
       fontSize: 8, color: DARK.textMuted, fontFace: "Helvetica",
     });
-    slide5.addText(`Issues: ${corsMeta.issues.length}`, {
+    const corsIssues = corsMeta.issues ?? [];
+    slide5.addText(`Issues: ${corsIssues.length}`, {
       x: 9.36, y: 5.1, w: 3.27, h: 0.25,
-      fontSize: 8, color: corsMeta.issues.length > 0 ? DARK.amber : DARK.green, fontFace: "Helvetica",
+      fontSize: 8, color: corsIssues.length > 0 ? DARK.amber : DARK.green, fontFace: "Helvetica",
     });
+  }
+  } catch (e) {
+    slideErrors.push(`Slide 5: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 5 failed:`, e);
   }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 6 - Performance: Latency Bottlenecks
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide6 = addDarkSlide(pptx, "Performance: Latency Bottlenecks", 6);
 
   // Performance score badge
@@ -691,13 +752,14 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
 
     const cwvRows: PptxGenJS.TableRow[] = cwvKeys.map(key => {
       const metric = cwv[key];
+      if (!metric || !metric.rating) return null;
       const ratingColor = metric.rating === "good" ? DARK.green : metric.rating === "poor" ? DARK.red : DARK.amber;
       return [
         { text: key.toUpperCase(), options: { fontSize: 9, color: DARK.text, fill: { color: DARK.card }, bold: true } },
-        { text: typeof metric.value === "number" && metric.value > 10 ? formatMs(metric.value) : String(metric.value), options: { fontSize: 9, color: DARK.text, fill: { color: DARK.card }, align: "center" as const } },
+        { text: typeof metric.value === "number" && metric.value > 10 ? formatMs(metric.value) : String(metric.value ?? 'N/A'), options: { fontSize: 9, color: DARK.text, fill: { color: DARK.card }, align: "center" as const } },
         { text: metric.rating.toUpperCase(), options: { fontSize: 9, color: ratingColor, fill: { color: DARK.card }, align: "center" as const, bold: true } },
       ];
-    });
+    }).filter((row) => row !== null) as PptxGenJS.TableRow[];
 
     slide6.addTable([cwvHeader, ...cwvRows], {
       x: 0.5, y: 1.2, w: 9.7,
@@ -738,9 +800,9 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
         x: mx, y: lhY + 0.5, w: 2.2, h: 0.3,
         fontSize: 8, color: DARK.textMuted, fontFace: "Helvetica", align: "center",
       });
-      slide6.addText(String(m.value), {
+      slide6.addText(String(m.value ?? 'N/A'), {
         x: mx, y: lhY + 0.8, w: 2.2, h: 0.5,
-        fontSize: 20, bold: true, color: darkScoreColor(m.value),
+        fontSize: 20, bold: true, color: darkScoreColor(num(m.value)),
         fontFace: "Helvetica", align: "center",
       });
     });
@@ -755,22 +817,27 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       fontSize: 10, bold: true, color: DARK.purple, fontFace: "Helvetica",
     });
     const playerStats = [
-      `Startup: ${formatMs(player.startupDelay)}`,
-      `TTFF: ${formatMs(player.timeToFirstFrame)}`,
-      `Buffer Ratio: ${(player.bufferRatio * 100).toFixed(1)}%`,
-      `Rebuffer Events: ${player.rebufferEvents}`,
-      `ABR Switches: ${player.abrSwitchCount}`,
-      `DRM License: ${formatMs(player.drmLicenseTime)}`,
+      `Startup: ${formatMs(num(player.startupDelay))}`,
+      `TTFF: ${formatMs(num(player.timeToFirstFrame))}`,
+      `Buffer Ratio: ${(num(player.bufferRatio) * 100).toFixed(1)}%`,
+      `Rebuffer Events: ${num(player.rebufferEvents)}`,
+      `ABR Switches: ${num(player.abrSwitchCount)}`,
+      `DRM License: ${formatMs(num(player.drmLicenseTime))}`,
     ];
     slide6.addText(playerStats.join("    |    "), {
       x: 0.7, y: 5.9, w: 11.93, h: 0.6,
       fontSize: 9, color: DARK.text, fontFace: "Helvetica", wrap: true,
     });
   }
+  } catch (e) {
+    slideErrors.push(`Slide 6: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 6 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 7 - Performance: JavaScript Payload
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide7 = addDarkSlide(pptx, "Performance: JavaScript Payload & Resources", 7);
 
   const resources = perfMeta.resourceMetrics;
@@ -855,10 +922,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       fontSize: 13, color: DARK.textMuted, fontFace: "Helvetica",
     });
   }
+  } catch (e) {
+    slideErrors.push(`Slide 7: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 7 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 8 - Code Quality
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide8 = addDarkSlide(pptx, "Code Quality Analysis", 8);
 
   // Score badge
@@ -899,7 +971,7 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       });
     });
     // Top rules
-    const topRules = lint.rules.slice(0, 3);
+    const topRules = (lint.rules ?? []).slice(0, 3);
     topRules.forEach((r, i) => {
       slide8.addText(`${r.rule} (${r.count}x)`, {
         x: 0.9, y: 2.95 + i * 0.2, w: 4.2, h: 0.2,
@@ -916,12 +988,12 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
   });
   if (complexity) {
     const cxItems = [
-      { label: "Avg Cyclomatic", value: complexity.avgCyclomaticComplexity.toFixed(1) },
-      { label: "Max Cyclomatic", value: String(complexity.maxCyclomaticComplexity) },
-      { label: "Avg Cognitive", value: complexity.avgCognitiveComplexity.toFixed(1) },
-      { label: "Max Cognitive", value: String(complexity.maxCognitiveComplexity) },
-      { label: "Duplicate Blocks", value: String(complexity.duplicateBlocks) },
-      { label: "Tech Debt", value: complexity.technicalDebt },
+      { label: "Avg Cyclomatic", value: fix(complexity.avgCyclomaticComplexity) },
+      { label: "Max Cyclomatic", value: str(complexity.maxCyclomaticComplexity) },
+      { label: "Avg Cognitive", value: fix(complexity.avgCognitiveComplexity) },
+      { label: "Max Cognitive", value: str(complexity.maxCognitiveComplexity) },
+      { label: "Duplicate Blocks", value: str(complexity.duplicateBlocks) },
+      { label: "Tech Debt", value: str(complexity.technicalDebt) },
     ];
     cxItems.forEach((cx, i) => {
       slide8.addText(cx.label, {
@@ -953,7 +1025,7 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
 
     const apRows: PptxGenJS.TableRow[] = antiPatterns.slice(0, 7).map(ap => [
       { text: ap.pattern, options: { fontSize: 7, color: DARK.text, fill: { color: DARK.card } } },
-      { text: `${ap.file}:${ap.line}`, options: { fontSize: 7, color: DARK.textMuted, fill: { color: DARK.card } } },
+      { text: `${ap.file ?? '?'}:${ap.line ?? '?'}`, options: { fontSize: 7, color: DARK.textMuted, fill: { color: DARK.card } } },
       { text: ap.severity.toUpperCase(), options: { fontSize: 7, color: severityColor(ap.severity), fill: { color: DARK.card }, align: "center" as const, bold: true } },
       { text: ap.suggestion.slice(0, 60), options: { fontSize: 7, color: DARK.textMuted, fill: { color: DARK.card } } },
     ]);
@@ -971,10 +1043,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       fontSize: 10, color: DARK.green, fontFace: "Helvetica",
     });
   }
+  } catch (e) {
+    slideErrors.push(`Slide 8: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 8 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 9 - Regression Analysis
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide9 = addDarkSlide(pptx, "Regression Analysis", 9);
 
   const regressions = kpi.regressions;
@@ -1059,10 +1136,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       fontSize: 13, color: DARK.green, fontFace: "Helvetica",
     });
   }
+  } catch (e) {
+    slideErrors.push(`Slide 9: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 9 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 10 - Remediation Target Matrix
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide10 = addDarkSlide(pptx, "Remediation Target Matrix", 10);
 
   const topRecs = enhanced.sort((a, b) => b.projectedScoreGain - a.projectedScoreGain).slice(0, 5);
@@ -1122,10 +1204,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       fontSize: 13, color: DARK.textMuted, fontFace: "Helvetica",
     });
   }
+  } catch (e) {
+    slideErrors.push(`Slide 10: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 10 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 11 - Quick Win Analysis
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide11 = addDarkSlide(pptx, "Quick Win Analysis", 11);
 
   const quickWins = enhanced.filter(r => r.quickWin).sort((a, b) => b.projectedScoreGain - a.projectedScoreGain);
@@ -1206,10 +1293,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       fontSize: 13, color: DARK.textMuted, fontFace: "Helvetica",
     });
   }
+  } catch (e) {
+    slideErrors.push(`Slide 11: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 11 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 12 - Sprint Backlog Prioritization
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide12 = addDarkSlide(pptx, "Sprint Backlog Prioritization", 12);
 
   // Classify recommendations into quadrants
@@ -1294,10 +1386,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       fontSize: 6, color: DARK.textMuted, fontFace: "Helvetica",
     });
   });
+  } catch (e) {
+    slideErrors.push(`Slide 12: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 12 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 13 - Projected ROI
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide13 = addDarkSlide(pptx, "Projected ROI", 13);
 
   // Calculate projected scores
@@ -1368,10 +1465,15 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
     fontSize: 10, color: projectedOverall >= 95 ? DARK.green : DARK.amber,
     fontFace: "Helvetica", align: "center",
   });
+  } catch (e) {
+    slideErrors.push(`Slide 13: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 13 failed:`, e);
+  }
 
   // ════════════════════════════════════════════════════════════════
   // SLIDE 14 - Developer Handoff and Action Items
   // ════════════════════════════════════════════════════════════════
+  try {
   const slide14 = addDarkSlide(pptx, "Developer Handoff & Action Items", 14);
 
   // Immediate 24-hour actions (security hotfixes)
@@ -1453,8 +1555,16 @@ export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<
       fontSize: 10, color: DARK.green, fontFace: "Helvetica",
     });
   }
+  } catch (e) {
+    slideErrors.push(`Slide 14: ${e instanceof Error ? e.message : String(e)}`);
+    console.warn(`[PPTX] Slide 14 failed:`, e);
+  }
 
   // ── Save ──
+  if (slideErrors.length > 0) {
+    console.warn(`[PPTX] ${slideErrors.length} slide(s) had errors:`, slideErrors);
+  }
+
   const filename = `VZY-Platform-Analysis-${new Date().toISOString().slice(0, 10)}.pptx`;
   await pptx.writeFile({ fileName: filename });
 }
