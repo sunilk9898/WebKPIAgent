@@ -19,6 +19,14 @@ interface TrendChartProps {
   target?: number;
 }
 
+const LEGEND_ITEMS = [
+  { key: "score", label: "Overall", color: "#3b82f6" },
+  { key: "security", label: "Security", color: "#ef4444" },
+  { key: "performance", label: "Performance", color: "#22c55e" },
+  { key: "codeQuality", label: "Code Quality", color: "#a855f7" },
+  { key: "target", label: "Target (95)", color: "#22c55e", dashed: true },
+];
+
 export function TrendChart({
   data,
   height = 280,
@@ -34,6 +42,24 @@ export function TrendChart({
   }));
 
   return (
+    <div>
+      {/* Legend */}
+      {showBreakdown && (
+        <div className="flex items-center justify-end gap-4 mb-2 px-2">
+          {LEGEND_ITEMS.map((item) => (
+            <div key={item.key} className="flex items-center gap-1.5">
+              <div
+                className="w-4 h-0.5 rounded-full"
+                style={{
+                  backgroundColor: item.color,
+                  ...(item.dashed ? { backgroundImage: `repeating-linear-gradient(90deg, ${item.color} 0, ${item.color} 3px, transparent 3px, transparent 6px)`, backgroundColor: "transparent" } : {}),
+                }}
+              />
+              <span className="text-[10px] text-gray-500">{item.label}</span>
+            </div>
+          ))}
+        </div>
+      )}
     <ResponsiveContainer width="100%" height={height}>
       <AreaChart data={formatted} margin={{ top: 8, right: 8, left: -20, bottom: 0 }}>
         <defs>
@@ -112,5 +138,6 @@ export function TrendChart({
         />
       </AreaChart>
     </ResponsiveContainer>
+    </div>
   );
 }

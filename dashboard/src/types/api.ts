@@ -131,6 +131,7 @@ export interface EnhancedRecommendation extends Recommendation {
   affectedMetric: string;
   currentValue?: string;
   targetValue?: string;
+  remediation?: string;
 }
 
 export interface ScanComparison {

@@ -1,11 +1,15 @@
 "use client";
 
+import { useState } from "react";
 import {
   Sparkles, Zap, TrendingUp, Target, Shield, Gauge, Code2,
-  ArrowRight, CheckCircle2, AlertTriangle, ChevronRight,
+  ArrowRight, CheckCircle2, AlertTriangle, ChevronRight, ChevronDown,
+  Download, Copy, Share2, ClipboardCheck,
 } from "lucide-react";
+import Link from "next/link";
 import { BeforeAfterBar } from "@/components/charts/before-after-bar";
 import { cn, getSeverityBg } from "@/lib/utils";
+import { useToastStore } from "@/lib/store";
 import type { EnhancedRecommendation, Recommendation, KPIScore, AgentType } from "@/types/api";
 
 interface AIRecommendationsPanelProps {
@@ -19,6 +23,11 @@ export function AIRecommendationsPanel({
   enhancedRecommendations,
   kpiScore,
 }: AIRecommendationsPanelProps) {
+  const [expandedPriority, setExpandedPriority] = useState<Set<number>>(new Set());
+  const [expandedMatrix, setExpandedMatrix] = useState<Set<number>>(new Set());
+  const [copied, setCopied] = useState(false);
+  const addToast = useToastStore((s) => s.addToast);
+
   // Use enhanced if available, otherwise derive from base recommendations
   const enhanced: EnhancedRecommendation[] = enhancedRecommendations?.length
     ? enhancedRecommendations
@@ -56,20 +65,112 @@ export function AIRecommendationsPanel({
     { category: "Code Quality", current: cqCurrent, projected: cqProjected },
   ];
 
+  const togglePriority = (p: number) => {
+    setExpandedPriority((prev) => {
+      const next = new Set(prev);
+      next.has(p) ? next.delete(p) : next.add(p);
+      return next;
+    });
+  };
+
+  const toggleMatrix = (p: number) => {
+    setExpandedMatrix((prev) => {
+      const next = new Set(prev);
+      next.has(p) ? next.delete(p) : next.add(p);
+      return next;
+    });
+  };
+
+  // Build text summary for copy/download
+  const buildTextSummary = () => {
+    const lines: string[] = [];
+    lines.push("=== AI-Powered Recommendations ===");
+    lines.push(`Overall KPI: ${kpiScore.overallScore.toFixed(1)} → ${projectedOverall.toFixed(1)} (+${totalProjectedGain.toFixed(1)} pts)`);
+    lines.push("");
+    lines.push("--- Top 5 Priority Fixes ---");
+    topFixes.forEach((rec) => {
+      lines.push(`${rec.priority}. ${rec.title} [${rec.category}]`);
+      lines.push(`   ${rec.description}`);
+      lines.push(`   Impact: ${rec.impactScore}/10 | Risk: ${rec.riskScore}/10 | Ease: ${rec.easeScore}/10 | Gain: +${displayGain(rec).toFixed(1)} pts | Effort: ${rec.effort}`);
+      if (rec.remediation) lines.push(`   Fix: ${rec.remediation}`);
+      lines.push("");
+    });
+    lines.push("--- Success Matrix ---");
+    enhanced.forEach((rec) => {
+      lines.push(`${rec.priority}. ${rec.title} [${rec.category}] | Gain: +${displayGain(rec).toFixed(1)} | Effort: ${rec.effort} | Confidence: ${(rec.confidence * 100).toFixed(0)}%`);
+    });
+    return lines.join("\n");
+  };
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(buildTextSummary());
+      setCopied(true);
+      addToast({ type: "success", title: "Copied to clipboard", duration: 2000 });
+      setTimeout(() => setCopied(false), 2000);
+    } catch { addToast({ type: "error", title: "Copy failed", duration: 2000 }); }
+  };
+
+  const handleDownload = () => {
+    const blob = new Blob([buildTextSummary()], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `vzy-recommendations-${new Date().toISOString().split("T")[0]}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    addToast({ type: "success", title: "Downloaded recommendations", duration: 2000 });
+  };
+
+  const handleDownloadCSV = () => {
+    const headers = ["Priority", "Issue", "Category", "Impact", "Risk", "Ease", "Gain", "Effort", "Confidence", "Description"];
+    const rows = enhanced.map((rec) => [
+      rec.priority, `"${rec.title}"`, rec.category, rec.impactScore, rec.riskScore,
+      rec.easeScore, `+${displayGain(rec).toFixed(1)}`, rec.effort,
+      `${(rec.confidence * 100).toFixed(0)}%`, `"${rec.description || ""}"`,
+    ]);
+    const csv = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `vzy-success-matrix-${new Date().toISOString().split("T")[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    addToast({ type: "success", title: "Downloaded CSV", duration: 2000 });
+  };
+
+  // Link to the relevant page based on category
+  const categoryLink = (category: string) =>
+    category === "security" ? "/security" : category === "performance" ? "/performance" : "/code-quality";
+
   return (
     <div className="space-y-6">
-      {/* Section Header */}
-      <div className="flex items-center gap-3">
-        <div className="p-2 rounded-lg bg-brand-600/20">
-          <Sparkles className="w-5 h-5 text-brand-400" />
+      {/* Section Header with action buttons */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="p-2 rounded-lg bg-brand-600/20">
+            <Sparkles className="w-5 h-5 text-brand-400" />
+          </div>
+          <div>
+            <h2 className="text-sm font-bold text-gray-100">AI-Powered Recommendations</h2>
+            <p className="text-xs text-gray-500">Smart prioritization based on risk, impact, and ease of implementation</p>
+          </div>
         </div>
-        <div>
-          <h2 className="text-sm font-bold text-gray-100">AI-Powered Recommendations</h2>
-          <p className="text-xs text-gray-500">Smart prioritization based on risk, impact, and ease of implementation</p>
+        <div className="flex items-center gap-1.5">
+          <button onClick={handleCopy} className="btn-ghost p-2 text-gray-500 hover:text-gray-300" title="Copy summary">
+            {copied ? <ClipboardCheck className="w-4 h-4 text-green-400" /> : <Copy className="w-4 h-4" />}
+          </button>
+          <button onClick={handleDownload} className="btn-ghost p-2 text-gray-500 hover:text-gray-300" title="Download as text">
+            <Download className="w-4 h-4" />
+          </button>
+          <button onClick={handleDownloadCSV} className="btn-ghost p-2 text-gray-500 hover:text-gray-300" title="Download CSV">
+            <Share2 className="w-4 h-4" />
+          </button>
         </div>
       </div>
 
-      {/* ── Top 5 Priority Fixes ── */}
+      {/* ── Top 5 Priority Fixes (clickable/expandable) ── */}
       <div className="card">
         <div className="px-5 py-4 border-b border-white/[0.06] flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -81,58 +182,107 @@ export function AIRecommendationsPanel({
           </div>
         </div>
         <div className="divide-y divide-white/[0.04]">
-          {topFixes.map((rec) => (
-            <div key={rec.priority} className="px-5 py-4 hover:bg-white/[0.02] transition-colors">
-              <div className="flex items-start gap-4">
-                {/* Priority badge */}
-                <div className={cn(
-                  "flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold",
-                  rec.priority <= 2 ? "bg-red-500/20 text-red-400" :
-                  rec.priority <= 4 ? "bg-amber-500/20 text-amber-400" :
-                  "bg-blue-500/20 text-blue-400",
-                )}>
-                  {rec.priority}
-                </div>
-
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="text-sm font-medium text-gray-200">{rec.title}</span>
-                    <CategoryBadge category={rec.category} />
-                  </div>
-                  <div className="text-xs text-gray-400 mb-2">{rec.description}</div>
-
-                  {/* Scores row */}
-                  <div className="flex items-center gap-4 flex-wrap">
-                    <ScoreChip label="Impact" value={rec.impactScore} max={10} colorHigh="text-red-400" />
-                    <ScoreChip label="Risk" value={rec.riskScore} max={10} colorHigh="text-amber-400" />
-                    <ScoreChip label="Ease" value={rec.easeScore} max={10} colorHigh="text-green-400" />
-                    <div className="flex items-center gap-1 text-xs">
-                      <TrendingUp className="w-3 h-3 text-green-400" />
-                      <span className="text-green-400 font-semibold">+{displayGain(rec).toFixed(1)}</span>
-                      <span className="text-gray-500">pts</span>
-                    </div>
-                    <span className={cn(
-                      "text-[10px] px-2 py-0.5 rounded-full font-medium",
-                      rec.effort === "low" ? "bg-green-500/15 text-green-400" :
-                      rec.effort === "medium" ? "bg-amber-500/15 text-amber-400" :
-                      "bg-red-500/15 text-red-400",
+          {topFixes.map((rec) => {
+            const isExpanded = expandedPriority.has(rec.priority);
+            return (
+              <div key={rec.priority}>
+                <div
+                  onClick={() => togglePriority(rec.priority)}
+                  className="px-5 py-4 hover:bg-white/[0.02] transition-colors cursor-pointer"
+                >
+                  <div className="flex items-start gap-4">
+                    {/* Priority badge */}
+                    <div className={cn(
+                      "flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold",
+                      rec.priority <= 2 ? "bg-red-500/20 text-red-400" :
+                      rec.priority <= 4 ? "bg-amber-500/20 text-amber-400" :
+                      "bg-blue-500/20 text-blue-400",
                     )}>
-                      {rec.effort} effort
-                    </span>
-                    {rec.quickWin && (
-                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-brand-500/15 text-brand-400 font-medium flex items-center gap-1">
-                        <Zap className="w-2.5 h-2.5" /> Quick Win
-                      </span>
-                    )}
+                      {rec.priority}
+                    </div>
+
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1">
+                        {isExpanded ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-gray-500 shrink-0" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-gray-500 shrink-0" />
+                        )}
+                        <span className="text-sm font-medium text-gray-200">{rec.title}</span>
+                        <CategoryBadge category={rec.category} />
+                      </div>
+                      <div className="text-xs text-gray-400 mb-2 pl-5">{rec.description}</div>
+
+                      {/* Scores row */}
+                      <div className="flex items-center gap-4 flex-wrap pl-5">
+                        <ScoreChip label="Impact" value={rec.impactScore} max={10} colorHigh="text-red-400" />
+                        <ScoreChip label="Risk" value={rec.riskScore} max={10} colorHigh="text-amber-400" />
+                        <ScoreChip label="Ease" value={rec.easeScore} max={10} colorHigh="text-green-400" />
+                        <div className="flex items-center gap-1 text-xs">
+                          <TrendingUp className="w-3 h-3 text-green-400" />
+                          <span className="text-green-400 font-semibold">+{displayGain(rec).toFixed(1)}</span>
+                          <span className="text-gray-500">pts</span>
+                        </div>
+                        <span className={cn(
+                          "text-[10px] px-2 py-0.5 rounded-full font-medium",
+                          rec.effort === "low" ? "bg-green-500/15 text-green-400" :
+                          rec.effort === "medium" ? "bg-amber-500/15 text-amber-400" :
+                          "bg-red-500/15 text-red-400",
+                        )}>
+                          {rec.effort} effort
+                        </span>
+                        {rec.quickWin && (
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-brand-500/15 text-brand-400 font-medium flex items-center gap-1">
+                            <Zap className="w-2.5 h-2.5" /> Quick Win
+                          </span>
+                        )}
+                      </div>
+                    </div>
                   </div>
                 </div>
+
+                {/* Expanded detail panel */}
+                {isExpanded && (
+                  <div className="px-5 pb-4 pl-[76px] space-y-3 animate-fade-up">
+                    {rec.remediation && (
+                      <div className="bg-surface-1 rounded-lg p-3 border border-white/[0.04]">
+                        <div className="text-[10px] text-gray-500 uppercase tracking-wider font-medium mb-1">Remediation</div>
+                        <div className="text-xs text-gray-300">{rec.remediation}</div>
+                      </div>
+                    )}
+                    {rec.affectedMetric && (
+                      <div className="text-xs text-gray-500">
+                        <span className="font-medium">Affected metric:</span> {rec.affectedMetric}
+                      </div>
+                    )}
+                    <div className="flex items-center gap-3">
+                      <Link
+                        href={categoryLink(rec.category)}
+                        className="text-xs text-brand-400 hover:text-brand-300 flex items-center gap-1"
+                      >
+                        View {rec.category} findings <ArrowRight className="w-3 h-3" />
+                      </Link>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const text = `${rec.priority}. ${rec.title}\n${rec.description}\nRemediation: ${rec.remediation || "N/A"}\nGain: +${displayGain(rec).toFixed(1)} pts`;
+                          navigator.clipboard.writeText(text);
+                          addToast({ type: "success", title: "Copied fix details", duration: 2000 });
+                        }}
+                        className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1"
+                      >
+                        <Copy className="w-3 h-3" /> Copy
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
-      {/* ── Quick Wins ── */}
+      {/* ── Quick Wins (clickable → navigate to category page) ── */}
       {quickWins.length > 0 && (
         <div className="card p-5">
           <div className="flex items-center gap-2 mb-3">
@@ -142,11 +292,16 @@ export function AIRecommendationsPanel({
           </div>
           <div className="flex flex-wrap gap-2">
             {quickWins.map((qw) => (
-              <div key={qw.priority} className="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-1 border border-white/[0.04]">
+              <Link
+                key={qw.priority}
+                href={categoryLink(qw.category)}
+                className="flex items-center gap-2 px-3 py-2 rounded-lg bg-surface-1 border border-white/[0.04] hover:bg-white/[0.04] hover:border-brand-500/30 transition-colors cursor-pointer group"
+              >
                 <CategoryIcon category={qw.category} />
-                <span className="text-xs text-gray-300">{qw.title}</span>
+                <span className="text-xs text-gray-300 group-hover:text-gray-200">{qw.title}</span>
                 <span className="text-[10px] text-green-400 font-semibold">+{displayGain(qw).toFixed(1)}</span>
-              </div>
+                <ArrowRight className="w-3 h-3 text-gray-600 group-hover:text-brand-400 transition-colors" />
+              </Link>
             ))}
           </div>
         </div>
@@ -182,11 +337,16 @@ export function AIRecommendationsPanel({
         </div>
       </div>
 
-      {/* ── Success Matrix ── */}
+      {/* ── Success Matrix (clickable rows with expansion) ── */}
       <div className="card">
-        <div className="px-5 py-4 border-b border-white/[0.06] flex items-center gap-2">
-          <CheckCircle2 className="w-4 h-4 text-brand-400" />
-          <h3 className="text-sm font-semibold text-gray-200">Success Matrix</h3>
+        <div className="px-5 py-4 border-b border-white/[0.06] flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-brand-400" />
+            <h3 className="text-sm font-semibold text-gray-200">Success Matrix</h3>
+          </div>
+          <button onClick={handleDownloadCSV} className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1 transition-colors" title="Download as CSV">
+            <Download className="w-3 h-3" /> CSV
+          </button>
         </div>
         <div className="overflow-x-auto">
           <table className="data-table">
@@ -203,51 +363,95 @@ export function AIRecommendationsPanel({
               </tr>
             </thead>
             <tbody>
-              {enhanced.map((rec) => (
-                <tr key={rec.priority}>
-                  <td className="text-xs font-bold text-gray-400">{rec.priority}</td>
-                  <td className="text-xs text-gray-200 max-w-[200px] truncate">{rec.title}</td>
-                  <td><CategoryBadge category={rec.category} /></td>
-                  <td>
-                    <div className="flex items-center gap-1">
-                      {Array.from({ length: 5 }, (_, i) => (
-                        <div
-                          key={i}
-                          className={cn(
-                            "w-1.5 h-4 rounded-sm",
-                            i < Math.ceil(rec.riskScore / 2) ? "bg-red-500/80" : "bg-white/[0.06]",
-                          )}
-                        />
-                      ))}
-                    </div>
-                  </td>
-                  <td>
-                    <div className="flex items-center gap-1">
-                      {Array.from({ length: 5 }, (_, i) => (
-                        <div
-                          key={i}
-                          className={cn(
-                            "w-1.5 h-4 rounded-sm",
-                            i < Math.ceil(rec.impactScore / 2) ? "bg-amber-500/80" : "bg-white/[0.06]",
-                          )}
-                        />
-                      ))}
-                    </div>
-                  </td>
-                  <td className="text-xs font-semibold text-green-400">+{displayGain(rec).toFixed(1)}</td>
-                  <td>
-                    <span className={cn(
-                      "text-[10px] px-2 py-0.5 rounded-full font-medium",
-                      rec.effort === "low" ? "bg-green-500/15 text-green-400" :
-                      rec.effort === "medium" ? "bg-amber-500/15 text-amber-400" :
-                      "bg-red-500/15 text-red-400",
-                    )}>
-                      {rec.effort}
-                    </span>
-                  </td>
-                  <td className="text-xs text-gray-400">{(rec.confidence * 100).toFixed(0)}%</td>
-                </tr>
-              ))}
+              {enhanced.map((rec) => {
+                const isExpanded = expandedMatrix.has(rec.priority);
+                return (
+                  <>
+                    <tr
+                      key={rec.priority}
+                      onClick={() => toggleMatrix(rec.priority)}
+                      className="cursor-pointer hover:bg-white/[0.03] transition-colors"
+                    >
+                      <td className="text-xs font-bold text-gray-400">{rec.priority}</td>
+                      <td className="text-xs text-gray-200 max-w-[200px]">
+                        <div className="flex items-center gap-1.5">
+                          {isExpanded ? <ChevronDown className="w-3 h-3 text-gray-500 shrink-0" /> : <ChevronRight className="w-3 h-3 text-gray-500 shrink-0" />}
+                          <span className="truncate">{rec.title}</span>
+                        </div>
+                      </td>
+                      <td><CategoryBadge category={rec.category} /></td>
+                      <td>
+                        <div className="flex items-center gap-1">
+                          {Array.from({ length: 5 }, (_, i) => (
+                            <div
+                              key={i}
+                              className={cn(
+                                "w-1.5 h-4 rounded-sm",
+                                i < Math.ceil(rec.riskScore / 2) ? "bg-red-500/80" : "bg-white/[0.06]",
+                              )}
+                            />
+                          ))}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="flex items-center gap-1">
+                          {Array.from({ length: 5 }, (_, i) => (
+                            <div
+                              key={i}
+                              className={cn(
+                                "w-1.5 h-4 rounded-sm",
+                                i < Math.ceil(rec.impactScore / 2) ? "bg-amber-500/80" : "bg-white/[0.06]",
+                              )}
+                            />
+                          ))}
+                        </div>
+                      </td>
+                      <td className="text-xs font-semibold text-green-400">+{displayGain(rec).toFixed(1)}</td>
+                      <td>
+                        <span className={cn(
+                          "text-[10px] px-2 py-0.5 rounded-full font-medium",
+                          rec.effort === "low" ? "bg-green-500/15 text-green-400" :
+                          rec.effort === "medium" ? "bg-amber-500/15 text-amber-400" :
+                          "bg-red-500/15 text-red-400",
+                        )}>
+                          {rec.effort}
+                        </span>
+                      </td>
+                      <td className="text-xs text-gray-400">{(rec.confidence * 100).toFixed(0)}%</td>
+                    </tr>
+                    {isExpanded && (
+                      <tr key={`${rec.priority}-detail`} className="bg-surface-1/50">
+                        <td colSpan={8} className="!py-3 !px-6">
+                          <div className="space-y-2">
+                            <div className="text-xs text-gray-300">{rec.description}</div>
+                            {rec.remediation && (
+                              <div className="bg-surface-0/50 rounded p-2 border border-white/[0.04]">
+                                <span className="text-[10px] text-gray-500 font-medium">Remediation: </span>
+                                <span className="text-xs text-gray-300">{rec.remediation}</span>
+                              </div>
+                            )}
+                            <div className="flex items-center gap-3">
+                              <Link href={categoryLink(rec.category)} className="text-xs text-brand-400 hover:text-brand-300 flex items-center gap-1">
+                                View details <ArrowRight className="w-3 h-3" />
+                              </Link>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  navigator.clipboard.writeText(`${rec.title}: ${rec.description}\nRemediation: ${rec.remediation || "N/A"}`);
+                                  addToast({ type: "success", title: "Copied", duration: 2000 });
+                                }}
+                                className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1"
+                              >
+                                <Copy className="w-3 h-3" /> Copy
+                              </button>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -291,13 +495,11 @@ function deriveEnhanced(r: Recommendation, index: number, kpiScore: KPIScore): E
   const impactScore = Math.max(1, 10 - index);
   const riskScore = Math.max(1, 8 - index);
   const weight = WEIGHTS[r.category] || 0.25;
-  // Gap-based projection: each fix recovers a fraction of the remaining gap to 100
   const categoryScore = r.category === "security" ? kpiScore.grades.security.rawScore :
     r.category === "performance" ? kpiScore.grades.performance.rawScore :
     kpiScore.grades.codeQuality.rawScore;
   const gap = 100 - categoryScore;
-  // Higher-priority items recover more of the gap; scale by weight for overall contribution
-  const recoveryFraction = (impactScore / 10) * 0.15; // top item recovers ~15% of gap
+  const recoveryFraction = (impactScore / 10) * 0.15;
   const projectedGain = Math.round(gap * recoveryFraction * weight * 100) / 100;
 
   return {
