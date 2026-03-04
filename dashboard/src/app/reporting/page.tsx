@@ -80,6 +80,9 @@ export default function ReportingPage() {
     setPdfGenerating("pptx");
     try {
       await generatePlatformAnalysisPPTX(report);
+    } catch (err) {
+      console.error("PPTX generation error:", err);
+      alert("Failed to generate PPTX. Check console for details.");
     } finally {
       setPdfGenerating(null);
     }

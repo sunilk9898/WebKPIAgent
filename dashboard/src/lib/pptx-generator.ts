@@ -197,7 +197,7 @@ function addBrandedSlide(pptx: PptxGenJS, title: string): PptxGenJS.Slide {
 // ============================================================================
 // PUBLIC: Generate Platform Analysis PPTX (14 slides, dark theme)
 // ============================================================================
-export function generatePlatformAnalysisPPTX(report: ScanReport): void {
+export async function generatePlatformAnalysisPPTX(report: ScanReport): Promise<void> {
   const pptx = new PptxGenJS();
   pptx.layout = "LAYOUT_WIDE"; // 13.33" x 7.5"
   pptx.author = "VZY OTT AI Agent";
@@ -1456,7 +1456,7 @@ export function generatePlatformAnalysisPPTX(report: ScanReport): void {
 
   // ── Save ──
   const filename = `VZY-Platform-Analysis-${new Date().toISOString().slice(0, 10)}.pptx`;
-  pptx.writeFile({ fileName: filename });
+  await pptx.writeFile({ fileName: filename });
 }
 
 // ============================================================================
