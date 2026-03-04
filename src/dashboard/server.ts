@@ -969,12 +969,124 @@ app.post('/api/chat', authMiddleware as any, async (req: AuthRequest, res: Respo
       }
     }
 
-    // If OpenAI is not configured, return fallback
-    if (!openai) {
-      return res.json({
-        reply: 'AI chat requires an OpenAI API key. Configure OPENAI_API_KEY in your environment to enable the AI assistant.',
-        mode,
-      });
+    // If OpenAI is not configured or API key is a placeholder, return data-driven fallback
+    const chatKeyInvalid = !openai ||
+      !process.env.OPENAI_API_KEY ||
+      process.env.OPENAI_API_KEY.includes('PLACEHOLDER') ||
+      process.env.OPENAI_API_KEY.includes('your-') ||
+      process.env.OPENAI_API_KEY.length < 20;
+
+    if (chatKeyInvalid) {
+      // Generate a useful response from the report data instead of failing
+      let reply = '';
+      if (reportData) {
+        const kpi = reportData.kpiScore || {};
+        const grades = kpi.grades || {};
+        const findings = reportData.criticalFindings || [];
+        const recommendations = reportData.recommendations || [];
+        const enhanced = reportData.enhancedRecommendations || [];
+        const regressions = kpi.regressions || [];
+        const msgLower = message.toLowerCase();
+
+        if (msgLower.includes('security') || msgLower.includes('vulnerab') || msgLower.includes('owasp')) {
+          const secFindings = findings.filter((f: any) => f.agent === 'security' || f.category?.toLowerCase().includes('owasp'));
+          reply = `## Security Analysis\n\n**Security Score:** ${grades.security?.rawScore?.toFixed(1) || 'N/A'}/100\n\n`;
+          reply += `### Critical & High Security Findings (${secFindings.length})\n\n`;
+          secFindings.slice(0, 10).forEach((f: any, i: number) => {
+            reply += `${i + 1}. **[${(f.severity || 'info').toUpperCase()}]** ${f.title}\n`;
+            if (f.category) reply += `   - Category: ${f.category}\n`;
+            if (f.evidence) reply += `   - Evidence: \`${f.evidence.substring(0, 150)}\`\n`;
+            if (f.remediation) reply += `   - **Fix:** ${f.remediation.substring(0, 200)}\n`;
+            reply += '\n';
+          });
+          if (secFindings.length === 0) reply += '_No critical/high security findings detected._\n';
+        } else if (msgLower.includes('performance') || msgLower.includes('speed') || msgLower.includes('lighthouse') || msgLower.includes('cwv') || msgLower.includes('core web')) {
+          const perfAgent = (reportData.agentResults || []).find((a: any) => a.agentType === 'performance');
+          const perfMeta = perfAgent?.metadata || {};
+          const lh = perfMeta.lighthouse || {};
+          reply = `## Performance Analysis\n\n**Performance Score:** ${grades.performance?.rawScore?.toFixed(1) || 'N/A'}/100\n\n`;
+          reply += `### Lighthouse Scores\n| Metric | Score |\n|--------|-------|\n`;
+          reply += `| Performance | ${lh.performanceScore ?? 'N/A'} |\n`;
+          reply += `| Accessibility | ${lh.accessibilityScore ?? 'N/A'} |\n`;
+          reply += `| Best Practices | ${lh.bestPracticesScore ?? 'N/A'} |\n`;
+          reply += `| SEO | ${lh.seoScore ?? 'N/A'} |\n\n`;
+          if (perfMeta.coreWebVitals) {
+            reply += `### Core Web Vitals\n`;
+            Object.entries(perfMeta.coreWebVitals).forEach(([key, val]: [string, any]) => {
+              if (val?.value !== undefined) reply += `- **${key.toUpperCase()}**: ${val.value} (${val.rating})\n`;
+            });
+          }
+          const perfFindings = findings.filter((f: any) => f.agent === 'performance');
+          if (perfFindings.length > 0) {
+            reply += `\n### Performance Issues (${perfFindings.length})\n\n`;
+            perfFindings.slice(0, 8).forEach((f: any, i: number) => {
+              reply += `${i + 1}. **[${(f.severity || 'info').toUpperCase()}]** ${f.title}\n`;
+              if (f.remediation) reply += `   - **Fix:** ${f.remediation.substring(0, 200)}\n`;
+            });
+          }
+        } else if (msgLower.includes('code quality') || msgLower.includes('lint') || msgLower.includes('complexity') || msgLower.includes('anti-pattern')) {
+          const cqAgent = (reportData.agentResults || []).find((a: any) => a.agentType === 'code-quality');
+          const cqMeta = cqAgent?.metadata || {};
+          reply = `## Code Quality Analysis\n\n**Code Quality Score:** ${grades.codeQuality?.rawScore?.toFixed(1) || 'N/A'}/100\n\n`;
+          if (cqMeta.lintResults) {
+            reply += `### Lint Results\n- Errors: ${cqMeta.lintResults.errors}\n- Warnings: ${cqMeta.lintResults.warnings}\n- Fixable: ${cqMeta.lintResults.fixable}\n\n`;
+          }
+          if (cqMeta.complexity) {
+            reply += `### Complexity\n- Avg Cyclomatic: ${cqMeta.complexity.avgCyclomaticComplexity}\n- Max Cyclomatic: ${cqMeta.complexity.maxCyclomaticComplexity}\n- Duplicate Blocks: ${cqMeta.complexity.duplicateBlocks}\n- Tech Debt: ${cqMeta.complexity.technicalDebt}\n\n`;
+          }
+          const cqFindings = findings.filter((f: any) => f.agent === 'code-quality');
+          if (cqFindings.length > 0) {
+            reply += `### Issues\n`;
+            cqFindings.slice(0, 8).forEach((f: any, i: number) => {
+              reply += `${i + 1}. **[${(f.severity || 'info').toUpperCase()}]** ${f.title}\n`;
+              if (f.remediation) reply += `   - Fix: ${f.remediation.substring(0, 200)}\n`;
+            });
+          }
+        } else if (msgLower.includes('recommend') || msgLower.includes('fix') || msgLower.includes('improve') || msgLower.includes('remediat')) {
+          reply = `## Remediation Recommendations\n\n`;
+          if (enhanced.length > 0) {
+            const sorted = [...enhanced].sort((a: any, b: any) => (b.projectedScoreGain || 0) - (a.projectedScoreGain || 0));
+            reply += `### Top Actions by Impact\n\n`;
+            sorted.slice(0, 10).forEach((r: any, i: number) => {
+              reply += `${i + 1}. **${r.title}**\n`;
+              reply += `   - Impact: ${r.impactScore || 'N/A'} | Effort: ${r.effort || 'N/A'} | Gain: +${(r.projectedScoreGain || 0).toFixed?.(1) ?? r.projectedScoreGain} pts\n`;
+              if (r.quickWin) reply += `   - ⚡ **Quick Win**\n`;
+              if (r.description) reply += `   - ${r.description.substring(0, 200)}\n`;
+              reply += '\n';
+            });
+          } else {
+            recommendations.slice(0, 10).forEach((r: any, i: number) => {
+              reply += `${i + 1}. **${r.title || r}**\n`;
+              if (r.priority) reply += `   - Priority: ${r.priority}\n`;
+              if (r.impact) reply += `   - Impact: ${r.impact}\n`;
+            });
+          }
+        } else {
+          // General overview
+          reply = `## Scan Report Overview\n\n`;
+          reply += `**Target:** ${reportData.target?.url || 'N/A'}\n`;
+          reply += `**Overall KPI:** ${kpi.overallScore?.toFixed(1) || 'N/A'}/100 ${kpi.passesThreshold ? '✅ PASS' : '❌ FAIL'}\n\n`;
+          reply += `| Pillar | Score | Weight |\n|--------|-------|--------|\n`;
+          reply += `| Security | ${grades.security?.rawScore?.toFixed(1) || 'N/A'} | 40% |\n`;
+          reply += `| Performance | ${grades.performance?.rawScore?.toFixed(1) || 'N/A'} | 35% |\n`;
+          reply += `| Code Quality | ${grades.codeQuality?.rawScore?.toFixed(1) || 'N/A'} | 25% |\n\n`;
+          reply += `**Critical Findings:** ${findings.length}\n`;
+          reply += `**Regressions:** ${regressions.length}\n\n`;
+          if (findings.length > 0) {
+            reply += `### Top Critical Issues\n`;
+            findings.slice(0, 5).forEach((f: any, i: number) => {
+              reply += `${i + 1}. **[${(f.severity || 'info').toUpperCase()}]** ${f.title}\n`;
+            });
+          }
+          reply += `\n_Ask about specific areas: security, performance, code quality, or recommendations._`;
+        }
+      } else {
+        reply = 'No scan report is currently loaded. Please run a scan first, then ask questions about the results.';
+      }
+
+      reply += '\n\n---\n_Data-driven response from scan report. Configure a valid OPENAI_API_KEY for AI-enhanced analysis._';
+
+      return res.json({ reply, mode });
     }
 
     // Build rich system prompt based on mode
