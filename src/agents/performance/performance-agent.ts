@@ -179,10 +179,26 @@ export class PerformanceAgent extends BaseAgent {
     super('performance');
   }
 
-  // Track warm-up state to skip redundant warm-ups in batch scans
-  // (each batch scan creates a new agent instance, but the Chrome process is fresh each time)
-  private static lastWarmupTime = 0;
-  private static readonly WARMUP_COOLDOWN = 120_000; // 2 minutes — skip warm-up if done recently
+  // ── Batch-scan isolation ──
+  // These were previously `static` (shared across ALL PerformanceAgent instances).
+  // That caused cross-contamination: URL A's cached redirect was used for URL B,
+  // and Chrome warm-up was skipped for subsequent scans even though each scan
+  // launches a FRESH Chrome process that needs its own warm-up.
+  // Now instance-level so every scan gets a clean slate.
+
+  /**
+   * Call before starting a new scan in the batch queue to guarantee zero
+   * leftover state from a previous scan.  Not strictly necessary now that
+   * the fields are instance-level, but kept as a safety net in case static
+   * references are ever reintroduced.
+   */
+  static resetBatchState(): void {
+    // Nothing to do anymore — fields are instance-level.  The method exists
+    // as a hook for the queue processor so future static caches are cleared.
+  }
+
+  // Per-instance warm-up flag (each Chrome process needs its own warm-up)
+  private warmupDone = false;
 
   protected async setup(config: ScanConfig): Promise<void> {
     const chromePath = process.env.CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
@@ -193,15 +209,9 @@ export class PerformanceAgent extends BaseAgent {
       ...(chromePath ? { chromePath } : {}),
     });
 
-    // Skip warm-up if Chrome was recently warmed (batch scans create many agents quickly)
-    const timeSinceWarmup = Date.now() - PerformanceAgent.lastWarmupTime;
-    if (timeSinceWarmup < PerformanceAgent.WARMUP_COOLDOWN) {
-      this.logger.info(`Chrome warm-up skipped (last warm-up ${Math.round(timeSinceWarmup / 1000)}s ago)`);
-      return;
-    }
-
-    // Warm up Chrome by loading a simple page first
-    // This prevents LanternError on first real scan in Docker
+    // Warm up this Chrome instance by loading a simple page first.
+    // This prevents LanternError on the first real scan in Docker.
+    // Every instance warms up its OWN Chrome (no more shared static timer).
     try {
       await lighthouse('https://example.com', {
         port: this.chrome.port,
@@ -214,7 +224,7 @@ export class PerformanceAgent extends BaseAgent {
           maxWaitForLoad: 10000,
         },
       });
-      PerformanceAgent.lastWarmupTime = Date.now();
+      this.warmupDone = true;
       this.logger.info('Chrome warm-up complete');
     } catch (e) {
       this.logger.warn('Chrome warm-up failed (non-critical)', { error: String(e) });
@@ -230,13 +240,15 @@ export class PerformanceAgent extends BaseAgent {
    * Uses Puppeteer to catch JavaScript/meta-refresh redirects that fetch() misses.
    * Results are cached for 10 minutes to speed up batch scans.
    */
-  private static redirectCache = new Map<string, { finalUrl: string; timestamp: number }>();
-  private static readonly REDIRECT_CACHE_TTL = 600_000; // 10 minutes
+  // Per-instance redirect cache — NOT shared across scans.
+  // Previously static, which caused URL B to receive URL A's cached redirect in batch scans.
+  private redirectCache = new Map<string, { finalUrl: string; timestamp: number }>();
+  private readonly REDIRECT_CACHE_TTL = 600_000; // 10 minutes
 
   private async resolveRedirects(url: string): Promise<string> {
     // Check cache first
-    const cached = PerformanceAgent.redirectCache.get(url);
-    if (cached && Date.now() - cached.timestamp < PerformanceAgent.REDIRECT_CACHE_TTL) {
+    const cached = this.redirectCache.get(url);
+    if (cached && Date.now() - cached.timestamp < this.REDIRECT_CACHE_TTL) {
       if (cached.finalUrl !== url) {
         this.logger.info(`Resolved redirect (cached): ${url} → ${cached.finalUrl}`);
       }
@@ -256,7 +268,7 @@ export class PerformanceAgent extends BaseAgent {
       const finalUrl = page.url();
       await page.close();
       // Cache the result regardless of whether there was a redirect
-      PerformanceAgent.redirectCache.set(url, { finalUrl: finalUrl || url, timestamp: Date.now() });
+      this.redirectCache.set(url, { finalUrl: finalUrl || url, timestamp: Date.now() });
       if (finalUrl && finalUrl !== url) {
         this.logger.info(`Resolved redirect: ${url} → ${finalUrl}`);
         return finalUrl;
@@ -267,7 +279,7 @@ export class PerformanceAgent extends BaseAgent {
       if (browser) await browser.close();
     }
     // Cache "no redirect" result too
-    PerformanceAgent.redirectCache.set(url, { finalUrl: url, timestamp: Date.now() });
+    this.redirectCache.set(url, { finalUrl: url, timestamp: Date.now() });
     return url;
   }
 

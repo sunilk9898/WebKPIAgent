@@ -14,6 +14,7 @@ import OpenAI from 'openai';
 import { Logger } from '../utils/logger';
 import { ResultStore } from '../store/result-store';
 import { Orchestrator } from '../orchestrator';
+import { PerformanceAgent } from '../agents/performance/performance-agent';
 
 const logger = new Logger('dashboard');
 const store = new ResultStore();
@@ -226,6 +227,10 @@ function processQueue(): void {
 
     nextJob.status = 'running';
     nextJob.startedAt = new Date().toISOString();
+
+    // Reset any shared agent state before each scan to prevent cross-contamination
+    // between URLs in a batch (redirect caches, warm-up timers, etc.)
+    PerformanceAgent.resetBatchState();
 
     const orchestrator = new Orchestrator();
     const abortController = new AbortController();

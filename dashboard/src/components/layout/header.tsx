@@ -1,11 +1,11 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { useReportStore, useAuthStore, useScanStore, useQueueStore } from "@/lib/store";
+import { useReportStore, useAuthStore, useScanStore, useQueueStore, type ActiveScanInfo, type QueuedScanInfo } from "@/lib/store";
 import { getScoreStatus, timeAgo, cn } from "@/lib/utils";
-import { abortScan, getLatestReport, getScannedUrls, type ScannedUrlEntry } from "@/lib/api";
+import { abortScan, getLatestReport, getScannedUrls, triggerScan, type ScannedUrlEntry } from "@/lib/api";
 import {
-  User, LogOut, Loader2, StopCircle, ChevronDown,
+  User, LogOut, Loader2, StopCircle, ChevronDown, RefreshCw, XCircle,
 } from "lucide-react";
 import { NotificationBell } from "./notification-bell";
 import { SystemHealthPanel } from "./system-health-panel";
@@ -20,7 +20,10 @@ export function Header() {
   const [scannedUrls, setScannedUrls] = useState<ScannedUrlEntry[]>([]);
   const [urlsLoaded, setUrlsLoaded] = useState(false);
   const [switching, setSwitching] = useState(false);
+  const [refreshingUrl, setRefreshingUrl] = useState<string | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+
+  const { activeScans, queuedScans } = useQueueStore();
 
   const status = report ? getScoreStatus(report.kpiScore.overallScore) : null;
   const currentUrl = report?.target?.url || report?.target?.repoPath || "";
@@ -60,6 +63,50 @@ export function Header() {
     } finally {
       setSwitching(false);
       setShowUrlDropdown(false);
+    }
+  };
+
+  // Check if a URL is currently being scanned (active or queued)
+  const getScanForUrl = (url: string): { scanId: string; status: "active" | "queued" } | null => {
+    const active = activeScans.find(s => s.url === url);
+    if (active) return { scanId: active.scanId, status: "active" };
+    const queued = queuedScans.find(s => s.url === url);
+    if (queued) return { scanId: queued.scanId, status: "queued" };
+    return null;
+  };
+
+  // Refresh (re-scan) a specific URL
+  const refreshUrl = async (url: string, e: React.MouseEvent) => {
+    e.stopPropagation(); // Don't trigger switch
+    setRefreshingUrl(url);
+    try {
+      const res = await triggerScan({ url });
+      const defaultAgentState = { progress: 0, status: "running" as const };
+      setActiveScan({
+        scanId: res.scanId,
+        status: "running",
+        startedAt: new Date().toISOString(),
+        agents: {
+          security: defaultAgentState,
+          performance: defaultAgentState,
+          "code-quality": defaultAgentState,
+          "report-generator": defaultAgentState,
+        },
+      });
+    } catch (err) {
+      console.warn("Failed to trigger refresh scan for", url, err);
+    } finally {
+      setRefreshingUrl(null);
+    }
+  };
+
+  // Cancel scan for a specific URL
+  const cancelUrlScan = async (scanId: string, e: React.MouseEvent) => {
+    e.stopPropagation(); // Don't trigger switch
+    try {
+      await abortScan(scanId);
+    } catch (err) {
+      console.warn("Failed to cancel scan", scanId, err);
     }
   };
 
@@ -112,34 +159,71 @@ export function Header() {
                   {!switching && urlsLoaded && scannedUrls.map((entry) => {
                     const isActive = entry.url === currentUrl;
                     const score = Number(entry.score) || 0;
+                    const urlScan = getScanForUrl(entry.url);
+                    const isRefreshing = refreshingUrl === entry.url;
                     let hostname = entry.url;
                     try { hostname = new URL(entry.url).hostname.replace("www.", ""); } catch {}
                     return (
-                      <button
+                      <div
                         key={entry.url}
-                        onClick={() => switchToUrl(entry.url)}
                         className={cn(
-                          "w-full text-left px-3 py-2.5 hover:bg-white/[0.06] transition-colors flex items-center justify-between gap-3",
+                          "w-full text-left px-3 py-2.5 hover:bg-white/[0.06] transition-colors flex items-center justify-between gap-2 group",
                           isActive && "bg-brand-600/10",
                         )}
                       >
-                        <div className="min-w-0 flex-1">
+                        {/* Clickable URL info area */}
+                        <button
+                          onClick={() => switchToUrl(entry.url)}
+                          className="min-w-0 flex-1 text-left"
+                        >
                           <div className="text-xs font-medium text-gray-200 flex items-center gap-2">
                             {hostname}
                             {isActive && <span className="text-[9px] px-1.5 py-0.5 rounded bg-brand-500/20 text-brand-400">Active</span>}
+                            {urlScan && (
+                              <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 flex items-center gap-1">
+                                <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                                {urlScan.status === "active" ? "Scanning" : "Queued"}
+                              </span>
+                            )}
                           </div>
                           <div className="text-[10px] text-gray-600 truncate">{entry.url}</div>
-                        </div>
-                        <div className="flex items-center gap-3 shrink-0">
+                        </button>
+
+                        {/* Score + actions */}
+                        <div className="flex items-center gap-2 shrink-0">
                           <span className={cn(
                             "text-sm font-bold tabular-nums",
                             score >= 90 ? "text-green-400" : score >= 70 ? "text-amber-400" : "text-red-400",
                           )}>
                             {score.toFixed(1)}
                           </span>
-                          <span className="text-[10px] text-gray-600 w-16 text-right">{timeAgo(entry.scannedAt)}</span>
+                          <span className="text-[10px] text-gray-600 w-14 text-right">{timeAgo(entry.scannedAt)}</span>
+
+                          {/* Action buttons — visible on hover */}
+                          <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                            {urlScan ? (
+                              /* Cancel running/queued scan */
+                              <button
+                                onClick={(e) => cancelUrlScan(urlScan.scanId, e)}
+                                className="p-1 rounded hover:bg-red-500/20 transition-colors"
+                                title="Cancel scan"
+                              >
+                                <XCircle className="w-3.5 h-3.5 text-red-400" />
+                              </button>
+                            ) : (
+                              /* Refresh (re-scan) */
+                              <button
+                                onClick={(e) => refreshUrl(entry.url, e)}
+                                disabled={isRefreshing}
+                                className="p-1 rounded hover:bg-brand-500/20 transition-colors disabled:opacity-40"
+                                title="Re-scan this URL"
+                              >
+                                <RefreshCw className={cn("w-3.5 h-3.5 text-brand-400", isRefreshing && "animate-spin")} />
+                              </button>
+                            )}
+                          </div>
                         </div>
-                      </button>
+                      </div>
                     );
                   })}
                 </div>

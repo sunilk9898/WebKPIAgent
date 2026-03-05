@@ -48,6 +48,7 @@ export class ResultStore {
         );
         CREATE INDEX IF NOT EXISTS idx_scan_reports_target ON scan_reports(target_url);
         CREATE INDEX IF NOT EXISTS idx_scan_reports_date ON scan_reports(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_scan_reports_score ON scan_reports(overall_score);
       `);
       this.schemaReady = true;
     } catch (error) {
@@ -68,7 +69,14 @@ export class ResultStore {
           `INSERT INTO scan_reports (id, scan_id, target_url, platform, overall_score,
            security_score, performance_score, code_quality_score,
            critical_findings_count, report_json, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           ON CONFLICT (id) DO UPDATE SET
+             overall_score = EXCLUDED.overall_score,
+             security_score = EXCLUDED.security_score,
+             performance_score = EXCLUDED.performance_score,
+             code_quality_score = EXCLUDED.code_quality_score,
+             critical_findings_count = EXCLUDED.critical_findings_count,
+             report_json = EXCLUDED.report_json`,
           [
             report.id,
             report.scanId,
