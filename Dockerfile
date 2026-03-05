@@ -50,6 +50,9 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 # CHROME_PATH is used by chrome-launcher (for Lighthouse)
 ENV CHROME_PATH=/usr/bin/google-chrome-stable
 ENV NODE_ENV=production
+# Increase V8 heap to 3GB — Lighthouse + Chrome can easily exceed the default 1.5GB
+# especially during batch/competition scans with multiple sequential runs.
+ENV NODE_OPTIONS="--max-old-space-size=3072"
 
 WORKDIR /app
 

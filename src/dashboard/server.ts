@@ -50,11 +50,11 @@ interface QueuedScanJob {
   error?: string;
 }
 
-// Concurrent scan limit: 2 allows batch scans to run faster while keeping
-// Chrome resource contention manageable on a t3.medium (2 vCPU / 4GB).
-// Each scan runs Chrome sequentially within itself, so 2 concurrent scans
-// typically alternate CPU-heavy phases. Override via SCAN_CONCURRENCY env var.
-const MAX_CONCURRENT_SCANS = parseInt(process.env.SCAN_CONCURRENCY || '2');
+// Concurrent scan limit: 1 to prevent OOM on t3.medium (2 vCPU / 4GB).
+// Each Lighthouse run + Chrome can consume 1.5–2GB heap; running 2 concurrent
+// scans pushes past the 4GB container limit, causing FATAL heap-limit crashes.
+// Override via SCAN_CONCURRENCY env var if running on a larger instance.
+const MAX_CONCURRENT_SCANS = parseInt(process.env.SCAN_CONCURRENCY || '1');
 const scanQueue: QueuedScanJob[] = [];
 const activeJobs = new Map<string, {
   job: QueuedScanJob;
