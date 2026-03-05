@@ -45,7 +45,9 @@ services:
       PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome-stable
       # Scan speed tuning
       LIGHTHOUSE_RUNS: "2"
-      SCAN_CONCURRENCY: "3"
+      # Run scans sequentially to prevent OOM and score contamination.
+      # Each Lighthouse+Chrome uses 1.5-2GB; running 2+ concurrently exceeds 4GB limit.
+      SCAN_CONCURRENCY: "1"
     # Chrome needs large /dev/shm for stable tracing (default 64MB is too small)
     shm_size: '2gb'
     volumes:
