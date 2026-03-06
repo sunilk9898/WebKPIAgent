@@ -743,8 +743,9 @@ app.post('/api/scans/:scanId/abort', authMiddleware, requireRole('admin', 'devop
     return res.json({ message: 'Queued scan aborted', scanId });
   }
 
-  // Check if it's a running scan
-  const running = runningScans.get(scanId);
+  // Check if it's a running scan (try both maps — activeJobs is the queue system, runningScans is legacy)
+  const active = activeJobs.get(scanId);
+  const running = active || runningScans.get(scanId);
   if (!running) {
     return res.status(404).json({ error: 'Scan not found or already completed' });
   }
@@ -758,8 +759,29 @@ app.post('/api/scans/:scanId/abort', authMiddleware, requireRole('admin', 'devop
       await (running.orchestrator as any).cancel();
     }
 
+    // Mark the queue job as errored so it doesn't block the queue
+    if (active) {
+      active.job.status = 'error';
+      active.job.error = 'Scan aborted by user';
+      active.job.completedAt = new Date().toISOString();
+      const batchId = active.job.batchId;
+
+      activeJobs.delete(scanId);
+
+      // Emit batch progress so batch UI updates
+      if (batchId) {
+        emitBatchProgress(active.job);
+        checkBatchComplete(batchId);
+      }
+    }
+
     runningScans.delete(scanId);
-    io.emit('scan:error', { scanId, error: 'Scan aborted by user' });
+
+    io.emit('scan:error', { scanId, url: active?.job.url, error: 'Scan aborted by user', batchId: active?.job.batchId });
+    broadcastQueueStatus();
+
+    // Process next queued scan now that this slot is free
+    processQueue();
 
     logger.info(`Scan aborted by ${req.user!.email}: ${scanId}`);
     res.json({ message: 'Scan aborted', scanId });
